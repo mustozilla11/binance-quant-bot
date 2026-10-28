@@ -1,0 +1,20 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Bytecode & Caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Runtime Logs
+*.log
+bot.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
