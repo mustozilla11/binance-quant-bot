@@ -56,6 +56,17 @@ DEFAULT_CONFIG = {
     "top_pairs_count": 25,
     "oi_min_increase_pct": 2.0,
     "top_trader_ls_max": 2.2,
+    "blacklist": [
+        "BZUSDT",
+        "XAUUSDT",
+        "PAXGUSDT",
+        "EURUSDT",
+        "USDCUSDT",
+        "FDUSDUSDT",
+        "TUSDUSDT",
+        "BUSDUSDT",
+        "USDPUSDT"
+    ],
     "telegram_token": "9012920209:AAG7Ydbts5nlwzurqWk9Ivv9FJY4q9uRvWA",
     "telegram_chat_id": "5355048685",
     "last_optimized_at": None,
@@ -229,7 +240,8 @@ class WalkForwardOptimizer:
         En hacimli ilk 5 kripto vadeli paritesini seçer.
         (Örn: BTCUSDT, ETHUSDT, SOLUSDT, DOGEUSDT, 1000PEPEUSDT vb.)
         """
-        pairs = self.client.get_top_volume_pairs(limit=30)
+        blacklist = self.config.get("blacklist", [])
+        pairs = self.client.get_top_volume_pairs(limit=30, blacklist=blacklist)
         target_crypto = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "1000PEPEUSDT", "XRPUSDT", "BNBUSDT", "SUIUSDT"]
         
         selected = []

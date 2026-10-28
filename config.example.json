@@ -11,6 +11,17 @@
     "top_pairs_count": 25,
     "oi_min_increase_pct": 2.0,
     "top_trader_ls_max": 2.2,
+    "blacklist": [
+        "BZUSDT",
+        "XAUUSDT",
+        "PAXGUSDT",
+        "EURUSDT",
+        "USDCUSDT",
+        "FDUSDUSDT",
+        "TUSDUSDT",
+        "BUSDUSDT",
+        "USDPUSDT"
+    ],
     "telegram_token": "YOUR_TELEGRAM_BOT_TOKEN",
     "telegram_chat_id": "YOUR_TELEGRAM_CHAT_ID",
     "last_optimized_at": null,

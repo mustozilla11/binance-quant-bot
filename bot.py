@@ -317,7 +317,8 @@ class PaperTradingBot:
             return
 
         top_n = int(self.config.get("top_pairs_count", 25))
-        top_pairs = self.client.get_top_volume_pairs(limit=top_n)
+        blacklist = set(self.config.get("blacklist", []))
+        top_pairs = self.client.get_top_volume_pairs(limit=top_n, blacklist=blacklist)
         lim_str = "Sınırsız (Unlimited)" if is_unlimited else f"{current_open}/{max_positions}"
         logger.info("Piyasa taranıyor: Top %d parite analiz ediliyor (Açık Pozisyonlar: %d | Limit: %s)...",
                     len(top_pairs), current_open, lim_str)
@@ -331,6 +332,10 @@ class PaperTradingBot:
         for symbol in top_pairs:
             if not self.is_running:
                 break
+
+            # Kara liste kontrolü
+            if symbol in blacklist:
+                continue
 
             # Zaten pozisyonda mıyız?
             if symbol in self.active_positions:

@@ -11,6 +11,17 @@
     "top_pairs_count": 25,
     "oi_min_increase_pct": 2.0,
     "top_trader_ls_max": 2.2,
+    "blacklist": [
+        "BZUSDT",
+        "XAUUSDT",
+        "PAXGUSDT",
+        "EURUSDT",
+        "USDCUSDT",
+        "FDUSDUSDT",
+        "TUSDUSDT",
+        "BUSDUSDT",
+        "USDPUSDT"
+    ],
     "telegram_token": "9012920209:AAG7Ydbts5nlwzurqWk9Ivv9FJY4q9uRvWA",
     "telegram_chat_id": "5355048685",
     "last_optimized_at": "2026-10-28T13:38:18.132084",

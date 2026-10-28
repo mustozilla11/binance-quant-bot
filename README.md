@@ -74,6 +74,8 @@ Bot her 60 saniyede bir en hacimli 25 pariteyi 3 kademeli teyit filtresiyle süz
    Top Trader Long/Short oranı $\le 2.2$ olmalıdır. Oran 2.2 üzerindeyse piyasa aşırı kalabalık long pozisyondadır (Long Squeeze riski yüksektir) ve sinyal reddedilir.
 4. **Cooldown (Soğuma):**
    Bir coinde sinyal üretildikten sonra 30 dakika boyunca o pariteden yeni işlem açılmaz.
+5. **Kara Liste (Blacklist) Filtresi:**
+   Geleneksel emtialar (BZUSDT Brent petrol, XAUUSDT / PAXGUSDT altın), sabit coinler (USDC, FDUSD, TUSD) ve döviz türevleri (EURUSDT) düşük beta ve volatiliteye sahip oldukları için doğrudan elenir. Bot yalnızca yüksek dalga boyuna sahip saf kripto varlıkları analiz eder.
 
 ---
 

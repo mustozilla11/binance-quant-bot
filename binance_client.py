@@ -82,22 +82,25 @@ class BinanceFuturesClient:
 
         return None
 
-    def get_top_volume_pairs(self, limit: int = 25) -> List[str]:
+    def get_top_volume_pairs(self, limit: int = 25, blacklist: Optional[Any] = None) -> List[str]:
         """
         24 saatlik en yüksek USDT hacmine sahip vadeli pariteleri çeker.
-        Sabit coinler (USDC, FDUSD vb.) elenir.
+        Sabit coinler (USDC, FDUSD vb.) ve kara listedeki varlıklar elenir.
         """
         data = self._request("/fapi/v1/ticker/24hr")
         if not data or not isinstance(data, list):
             return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "PEPEUSDT"]
 
-        # Yalnızca USDT paritelerini filtrele ve stabil coin çiftlerini ele
-        excluded_stables = {"USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT", "EURUSDT", "USDPUSDT"}
+        # Yalnızca USDT paritelerini filtrele ve stabil coin / kara liste çiftlerini ele
+        excluded = {"USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT", "EURUSDT", "USDPUSDT"}
+        if blacklist:
+            excluded = excluded.union(set(blacklist))
+
         usdt_pairs = []
 
         for item in data:
             symbol = item.get("symbol", "")
-            if symbol.endswith("USDT") and symbol not in excluded_stables:
+            if symbol.endswith("USDT") and symbol not in excluded:
                 try:
                     quote_volume = float(item.get("quoteVolume", 0.0))
                     usdt_pairs.append((symbol, quote_volume))
