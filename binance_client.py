@@ -26,6 +26,10 @@ class BinanceFuturesClient:
         self.max_retries = max_retries
         self.session = requests.Session()
         
+        # TradFi (Emtia/Hisse) sembolleri önbelleği
+        self._tradifi_symbols: set[str] = set()
+        self._last_tradifi_fetch: float = 0.0
+
         # Türkiye / ISP SNI filtreleme kontrolü ve uygun URL kökünü belirleme
         self.base_url, self.custom_headers = self._determine_working_endpoint()
 
@@ -82,17 +86,55 @@ class BinanceFuturesClient:
 
         return None
 
+    def get_tradifi_symbols(self) -> set[str]:
+        """
+        Binance Futures exchangeInfo üzerinden geleneksel finans (TradFi)
+        türevlerini (Gümüş XAG, Altın XAU, Petrol BZ, Hisse/ETF tokenları) dinamik tespit eder.
+        """
+        now = time.time()
+        # 1 saatte bir önbelleği tazele
+        if self._tradifi_symbols and (now - self._last_tradifi_fetch < 3600):
+            return self._tradifi_symbols
+
+        try:
+            info = self._request("/fapi/v1/exchangeInfo")
+            if info and "symbols" in info:
+                tradifi = set()
+                for s in info["symbols"]:
+                    sym = s.get("symbol", "")
+                    ctype = s.get("contractType", "")
+                    utype = s.get("underlyingType", "")
+                    if ctype == "TRADIFI_PERPETUAL" or utype in ["COMMODITY", "EQUITY", "INDEX"]:
+                        tradifi.add(sym)
+                if tradifi:
+                    self._tradifi_symbols = tradifi
+                    self._last_tradifi_fetch = now
+                    logger.info("Binance TradFi filtresi güncellendi: %d adet emtia/hisse paritesi elendi.", len(tradifi))
+        except Exception as e:
+            logger.warning("TradFi sembollerini çekerken hata: %s", e)
+
+        return self._tradifi_symbols
+
     def get_top_volume_pairs(self, limit: int = 25, blacklist: Optional[Any] = None) -> List[str]:
         """
-        24 saatlik en yüksek USDT hacmine sahip vadeli pariteleri çeker.
-        Sabit coinler (USDC, FDUSD vb.) ve kara listedeki varlıklar elenir.
+        24 saatlik en yüksek USDT hacmine sahip saf kripto vadeli paritelerini çeker.
+        Gümüş (XAG), Altın (XAU), Petrol (BZ), hisseler, ETF'ler ve sabit coinler tamamen elenir.
+        Her 60 saniyede bir çağrıldığında anlık 24h hacme göre listeyi günceller.
         """
         data = self._request("/fapi/v1/ticker/24hr")
         if not data or not isinstance(data, list):
             return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "PEPEUSDT"]
 
-        # Yalnızca USDT paritelerini filtrele ve stabil coin / kara liste çiftlerini ele
-        excluded = {"USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT", "EURUSDT", "USDPUSDT"}
+        # Temel sabit coinler ve bilinen emtia/geleneksel varlıklar
+        base_excluded = {
+            "USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT", "EURUSDT", "USDPUSDT",
+            "STABLEUSDT", "USDEXUSDT", "FRAXUSDT", "XAGUSDT", "XAUUSDT", "BZUSDT",
+            "PAXGUSDT", "XAUTUSDT", "COPPERUSDT", "NATGASUSDT"
+        }
+        
+        # Binance API'den otomatik tespit edilen tüm TradFi sembolleri (230+ adet)
+        tradifi = self.get_tradifi_symbols()
+        excluded = base_excluded.union(tradifi)
         if blacklist:
             excluded = excluded.union(set(blacklist))
 

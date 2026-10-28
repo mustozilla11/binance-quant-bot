@@ -14,7 +14,11 @@
     "blacklist": [
         "BZUSDT",
         "XAUUSDT",
+        "XAGUSDT",
         "PAXGUSDT",
+        "XAUTUSDT",
+        "COPPERUSDT",
+        "NATGASUSDT",
         "EURUSDT",
         "USDCUSDT",
         "FDUSDUSDT",
