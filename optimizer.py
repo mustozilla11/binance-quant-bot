@@ -29,7 +29,6 @@ import itertools
 from datetime import datetime
 from typing import Dict, List, Any, Tuple, Optional
 import pandas as pd
-import pandas_ta as ta
 
 from binance_client import BinanceFuturesClient
 from telegram_notifier import TelegramNotifier
@@ -50,6 +49,11 @@ DEFAULT_CONFIG = {
     "trailing_delta_pct": 1.0,
     "max_concurrent_positions": 0,
     "trade_amount_usdt": 100.0,
+    "commission_pct": 0.12,
+    "break_even_trigger_pct": 1.5,
+    "break_even_lock_pct": 0.2,
+    "min_taker_buy_ratio": 0.55,
+    "min_close_strength": 0.60,
     "position_timeout_minutes": 40,
     "cooldown_minutes": 30,
     "scan_interval_seconds": 60,
@@ -59,7 +63,11 @@ DEFAULT_CONFIG = {
     "blacklist": [
         "BZUSDT",
         "XAUUSDT",
+        "XAGUSDT",
         "PAXGUSDT",
+        "XAUTUSDT",
+        "COPPERUSDT",
+        "NATGASUSDT",
         "EURUSDT",
         "USDCUSDT",
         "FDUSDUSDT",
@@ -120,11 +128,17 @@ class StrategyBacktester:
         stop_loss_pct: float,
         trailing_trigger_pct: float,
         trailing_delta_pct: float,
-        timeout_bars: int = 3, # 3 x 15m = 45 dk (zaman aşımı)
-        cooldown_bars: int = 2  # 30 dk soğuma
+        timeout_bars: int = 8,         # 8 x 5m = 40 dk (zaman aşımı)
+        cooldown_bars: int = 6,        # 6 x 5m = 30 dk soğuma
+        break_even_trigger: float = 1.5,
+        break_even_lock: float = 0.20,
+        commission_pct: float = 0.12,
+        min_taker_buy_ratio: float = 0.55,
+        min_close_strength: float = 0.60
     ) -> List[Dict[str, Any]]:
         """
-        Tek bir parite için geçmiş veride sanal işlem simülasyonu yapar.
+        Tek bir parite için geçmiş 5m veride sanal işlem simülasyonu yapar.
+        Komisyon (%0.12), alıcı baskısı ve başabaş (break-even) korumasını dahil eder.
         """
         trades = []
         n = len(df)
@@ -137,6 +151,7 @@ class StrategyBacktester:
         opens = df["open"].values
         volumes = df["volume"].values
         vol_smas = df["vol_sma"].values
+        taker_buys = pd.to_numeric(df["taker_buy_volume"], errors="coerce").fillna(0).values if "taker_buy_volume" in df.columns else (volumes * 0.6)
 
         last_exit_bar = -999
 
@@ -147,16 +162,23 @@ class StrategyBacktester:
                 i += 1
                 continue
 
-            # Giriş Koşulu: Hacim > SMA(20) * multiplier ve Yeşil Mum
             vol_sma = vol_smas[i]
             if vol_sma is None or pd.isna(vol_sma) or vol_sma <= 0:
                 i += 1
                 continue
 
-            if volumes[i] >= (vol_sma * vol_multiplier) and closes[i] > opens[i]:
+            # Giriş Koşulları: Hacim anomalisi + Yeşil mum + Alıcı baskısı + Üst fitil filtresi
+            vol_ok = volumes[i] >= (vol_sma * vol_multiplier)
+            bullish_ok = closes[i] > opens[i]
+            taker_ok = (taker_buys[i] / volumes[i] >= min_taker_buy_ratio) if volumes[i] > 0 else False
+            rng = highs[i] - lows[i]
+            strength_ok = ((closes[i] - lows[i]) / rng >= min_close_strength) if rng > 0 else True
+
+            if vol_ok and bullish_ok and taker_ok and strength_ok:
                 entry_price = closes[i]
                 entry_bar = i
                 trailing_active = False
+                break_even_active = False
                 peak_price = entry_price
                 exit_price = entry_price
                 exit_reason = "TIMEOUT"
@@ -168,26 +190,38 @@ class StrategyBacktester:
                     bar_low = lows[j]
                     bar_close = closes[j]
 
-                    # 1. Stop-Loss Kontrolü
-                    sl_price = entry_price * (1.0 - stop_loss_pct / 100.0)
-                    if bar_low <= sl_price:
-                        exit_price = sl_price
-                        exit_reason = "STOP_LOSS"
-                        exit_bar = j
-                        break
+                    # 1. Stop-Loss Kontrolü (Başabaş aktifse giriş + %0.20'ye taşınır)
+                    if break_even_active:
+                        effective_sl = entry_price * (1.0 + break_even_lock / 100.0)
+                        if bar_low <= effective_sl:
+                            exit_price = effective_sl
+                            exit_reason = "BREAK_EVEN"
+                            exit_bar = j
+                            break
+                    else:
+                        sl_price = entry_price * (1.0 - stop_loss_pct / 100.0)
+                        if bar_low <= sl_price:
+                            exit_price = sl_price
+                            exit_reason = "STOP_LOSS"
+                            exit_bar = j
+                            break
 
-                    # 2. Trailing TP Kontrolü
+                    # 2. Zirve fiyat ve kâr takibi
                     peak_price = max(peak_price, bar_high)
                     curr_max_profit_pct = ((peak_price - entry_price) / entry_price) * 100.0
 
+                    # Başabaş (Break-Even) tetikleme
+                    if curr_max_profit_pct >= break_even_trigger:
+                        break_even_active = True
+
+                    # Trailing TP Tetikleme
                     if curr_max_profit_pct >= trailing_trigger_pct:
                         trailing_active = True
 
                     if trailing_active:
                         trailing_stop_price = peak_price * (1.0 - trailing_delta_pct / 100.0)
                         if bar_low <= trailing_stop_price:
-                            # Trailing stop gerçekleşti
-                            exit_price = max(trailing_stop_price, sl_price)
+                            exit_price = max(trailing_stop_price, entry_price * (1.0 + break_even_lock / 100.0) if break_even_active else 0)
                             exit_reason = "TRAILING_TP"
                             exit_bar = j
                             break
@@ -199,12 +233,13 @@ class StrategyBacktester:
                         exit_bar = j
                         break
 
-                # PnL hesapla
-                pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0
+                # Net PnL (Borsa komisyonu düşülmüş)
+                gross_pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0
+                net_pnl_pct = gross_pnl_pct - commission_pct
                 trades.append({
                     "entry_bar": entry_bar,
                     "exit_bar": exit_bar,
-                    "pnl_pct": pnl_pct,
+                    "pnl_pct": net_pnl_pct,
                     "exit_reason": exit_reason
                 })
 
@@ -262,18 +297,18 @@ class WalkForwardOptimizer:
 
     def fetch_14d_klines(self, pairs: List[str]) -> Dict[str, pd.DataFrame]:
         """
-        Her parite için son 14 günün 15 dakikalık verisini çeker (14 gün * 96 mum = 1344 mum).
-        SMA(20) hacim indikatörünü ekler.
+        Her parite için son 5 günlük 5m mum verilerini çeker (1500 mum/parite).
+        SMA(20) hacim indikatörünü saf pandas ile hesaplar (pandas-ta gerektirmez).
         """
-        logger.info("Son 14 günlük 15m mum verileri indiriliyor (Pariteler: %s)...", pairs)
+        logger.info("Son 5 günlük 5m mum verileri indiriliyor (Pariteler: %s)...", pairs)
         klines_data = {}
 
         for symbol in pairs:
             try:
-                # 14 gün * 96 = 1344 mum
-                df = self.client.get_klines(symbol=symbol, interval="15m", limit=1344)
+                # 1500 mum x 5 dk = 125 saat (~5.2 gün) - canlı 5m tarayıcısıyla senkronize
+                df = self.client.get_klines(symbol=symbol, interval="5m", limit=1500)
                 if df is not None and len(df) >= 100:
-                    df["vol_sma"] = ta.sma(df["volume"], length=20)
+                    df["vol_sma"] = df["volume"].rolling(window=20).mean()
                     klines_data[symbol] = df
                     logger.info("✓ %s: %d mum başarıyla alındı.", symbol, len(df))
                 else:
@@ -312,6 +347,12 @@ class WalkForwardOptimizer:
 
         results = []
 
+        comm = float(self.config.get("commission_pct", 0.12))
+        be_trig = float(self.config.get("break_even_trigger_pct", 1.5))
+        be_lock = float(self.config.get("break_even_lock_pct", 0.2))
+        min_taker = float(self.config.get("min_taker_buy_ratio", 0.55))
+        min_close = float(self.config.get("min_close_strength", 0.60))
+
         for vol_mult, sl, tp, delta in param_grid:
             all_trades = []
             for symbol, df in klines_dict.items():
@@ -320,7 +361,12 @@ class WalkForwardOptimizer:
                     vol_multiplier=vol_mult,
                     stop_loss_pct=sl,
                     trailing_trigger_pct=tp,
-                    trailing_delta_pct=delta
+                    trailing_delta_pct=delta,
+                    break_even_trigger=be_trig,
+                    break_even_lock=be_lock,
+                    commission_pct=comm,
+                    min_taker_buy_ratio=min_taker,
+                    min_close_strength=min_close
                 )
                 all_trades.extend(trades)
 

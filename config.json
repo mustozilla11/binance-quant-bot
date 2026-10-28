@@ -1,10 +1,15 @@
 {
-    "volume_multiplier": 3.5,
-    "stop_loss_pct": 3.0,
+    "volume_multiplier": 2.8,
+    "stop_loss_pct": 1.5,
     "trailing_trigger_pct": 3.0,
     "trailing_delta_pct": 0.6,
     "max_concurrent_positions": 0,
     "trade_amount_usdt": 100.0,
+    "commission_pct": 0.12,
+    "break_even_trigger_pct": 1.5,
+    "break_even_lock_pct": 0.2,
+    "min_taker_buy_ratio": 0.55,
+    "min_close_strength": 0.6,
     "position_timeout_minutes": 40,
     "cooldown_minutes": 30,
     "scan_interval_seconds": 60,
@@ -28,12 +33,12 @@
     ],
     "telegram_token": "9012920209:AAG7Ydbts5nlwzurqWk9Ivv9FJY4q9uRvWA",
     "telegram_chat_id": "5355048685",
-    "last_optimized_at": "2026-10-28T13:38:18.132084",
+    "last_optimized_at": "2026-10-28T20:25:56.220903",
     "model_version": "v1.0",
     "last_optimization_stats": {
-        "profit_factor": 3.31,
-        "win_rate": 60.71,
-        "max_drawdown": 2.06,
-        "total_trades": 56
+        "profit_factor": 0.65,
+        "win_rate": 24.19,
+        "max_drawdown": 9.34,
+        "total_trades": 62
     }
 }

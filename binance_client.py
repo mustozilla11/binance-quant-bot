@@ -174,7 +174,7 @@ class BinanceFuturesClient:
         df = pd.DataFrame(raw_klines, columns=columns)
         
         # Sayısal dönüşümler
-        numeric_cols = ["open", "high", "low", "close", "volume", "quote_volume"]
+        numeric_cols = ["open", "high", "low", "close", "volume", "quote_volume", "taker_buy_volume", "taker_buy_quote_volume"]
         for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 

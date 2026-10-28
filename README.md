@@ -1,6 +1,6 @@
 # 🤖 Binance USDT-M Vadeli Piyasa Walk-Forward Self-Optimizing Paper Trading Bot
 
-Binance USDT-M Vadeli İşlemler piyasasında çalışan, Açık Pozisyon (Open Interest - OI) ve Hacim anomalilerini tarayan, Telegram bildirimli ve **"Kendi Parametrelerini Geriye Dönük Testle Güncelleyen" (Walk-Forward Self-Optimizing)** modüler kantitatif ticaret (quant trading) botu.
+Binance USDT-M Vadeli İşlemler piyasasında çalışan, Açık Pozisyon (Open Interest - OI), Hacim, Taker Alıcı Baskısı ve Mum Kapanış anomalilerini tarayan, Telegram çift yönlü interaktif komut destekli ve **"Kendi Parametrelerini Geriye Dönük Testle Güncelleyen" (Walk-Forward Self-Optimizing)** üst düzey kantitatif ticaret (quant trading) botu.
 
 ---
 
@@ -9,29 +9,31 @@ Binance USDT-M Vadeli İşlemler piyasasında çalışan, Açık Pozisyon (Open 
 ```
 binance_quant_bot/
 │
-├── config.json              # Aktif işlem parametreleri (Hot-Reload destekli)
+├── config.json              # Aktif işlem parametreleri (mtime tabanlı Hot-Reload destekli)
 ├── config.example.json      # Konfigürasyon şablonu
-├── binance_client.py        # Public Binance Futures REST API istemcisi (API Key gerektirmez)
-├── telegram_notifier.py     # Emojili sinyal, işlem kapanışı ve model bildirimleri
-├── optimizer.py             # 14 günlük Walk-Forward Grid Search optimizasyon motoru
-├── bot.py                   # Canlı piyasa tarayıcısı ve sanal pozisyon yöneticisi
-├── paper_trades.csv         # Sanal işlemlerin kaydedildiği defter
-├── requirements.txt         # Gerekli Python kütüphaneleri
+├── binance_client.py        # Public Binance Futures REST API istemcisi (API Key gerektirmez, TradFi filtreli)
+├── telegram_notifier.py     # Emojili bildirimler ve çift yönlü Telegram bot komut dinleyicisi (/durum, /rapor)
+├── optimizer.py             # 5m kline & komisyon simülasyonlu Walk-Forward Grid Search motoru
+├── bot.py                   # Canlı piyasa tarayıcısı, durum kalıcılığı (persistence) ve pozisyon yöneticisi
+├── active_positions.json    # Açık pozisyonların disk üzerindeki anlık durumu (Kapanıp açılsa da kaybolmaz)
+├── paper_trades.csv         # Komisyon kesintili gerçekçi net kâr/zarar defteri
+├── requirements.txt         # Minimal bağımlılıklar (Sadece requests ve pandas - C derleyicisi gerektirmez)
 ├── .gitignore               # Git tarafından yok sayılacak dosyalar
 └── README.md                # Kapsamlı mimari ve çalıştırma kılavuzu
 ```
 
 ---
 
-## 🛡️ 2. Güvenlik ve Bağlantı Mimarisi
+## 🛡️ 2. Güvenlik ve Ağ Mimarisi
 
 - **Sıfır Borsa API Anahtarı Riski:** Sistem kesinlikle borsa API Key veya Secret Key talep etmez veya kullanmaz. Tamamen Binance'in herkese açık halka açık uç noktalarından beslenir:
   - `/fapi/v1/ticker/24hr` (24 saatlik hacim sıralaması)
-  - `/fapi/v1/klines` (5m ve 15m mum verileri)
-  - `/futures/data/openInterestHist` (15m Açık Pozisyon geçmişi)
+  - `/fapi/v1/ticker/price` (Tek istekte tüm vadeli fiyatları çekme)
+  - `/fapi/v1/klines` (5m mum verileri & taker buy hacimleri)
+  - `/futures/data/openInterestHist` (Açık Pozisyon geçmişi)
   - `/futures/data/topLongShortPositionRatio` (Top Trader Long/Short oranları)
 - **Akıllı ISP & CloudFront Yönlendirmesi:** Türk Telekom / BTK veya kurumsal ağ filtrelerinde doğrudan `fapi.binance.com` SNI engeli yaşandığında, `binance_client.py` otomatik olarak Binance resmi CloudFront CDN altyapısına geçiş yapar ve kesintisiz çalışmaya devam eder.
-- **Telegram Entegrasyonu:** Bot başlatma, anomali sinyalleri, pozisyon kâr/zarar sonuçları ve model optimizasyon raporları anlık olarak Telegram kanalınıza iletilir.
+- **Hafif ve Kararlı Bağımlılık Yapısı:** `pandas-ta` ve `numba/llvmlite` bağımlılıkları tamamen kaldırılarak saf `pandas` rolling fonksiyonlarına geçilmiştir. Python 3.10'dan Python 3.14'e kadar tüm sürümlerde derleyici hatası olmadan saniyeler içinde kurulur.
 
 ---
 
@@ -39,21 +41,25 @@ binance_quant_bot/
 
 Sabit parametreli botlar değişen piyasa rejimlerinde verimsizleşir. Bu bot, piyasaya dinamik olarak uyum sağlamak için Walk-Forward Grid Search optimizasyonu çalıştırır:
 
-1. **Veri Toplama:** En hacimli ilk 5 kripto vadeli paritesinin (BTC, ETH, SOL, XRP, PEPE) son 14 günlük 15 dakikalık verilerini (1.344 mum/parite) indirir.
-2. **Grid Search Alanı:** Toplam 81 kombinasyon simüle edilir:
+1. **Veri Toplama:** En hacimli ilk 5 kripto vadeli paritesinin (BTC, ETH, SOL, XRP, PEPE) son 1.500 adet 5 dakikalık mum verilerini (Taker Buy hacimleri dahil) indirir.
+2. **5 Kademeli Filtre & Komisyon Simülasyonu:**
+   - Canlı bot ile 1-e-1 aynı 5 dakikalık filtreleri çalıştırır.
+   - Her işlemden `%0.12` oranında komisyon ve kayma (roundtrip fee + slippage) kesintisi uygular.
+   - Break-Even stop simülasyonunu içerir.
+3. **Grid Search Alanı:** Toplam 81 kombinasyon simüle edilir:
    - **Hacim Eşiği:** `[2.2x, 2.8x, 3.5x]`
    - **Stop-Loss:** `[%1.5, %2.0, %3.0]`
    - **Trailing TP Tetik:** `[%2.0, %3.0, %4.5]`
    - **Trailing Geri Çekilme (Delta):** `[%0.6, %1.0, %1.4]`
-3. **Seçim Kriteri:**
-   $$\text{Profit Factor} = \frac{\text{Brüt Kâr}}{\text{Brüt Zarar}}$$
+4. **Seçim Kriteri:**
+   $$\text{Profit Factor} = \frac{\text{Net Kâr}}{\text{Net Zarar}}$$
    $$\text{Max Drawdown} = \max \left( \frac{\text{Zirve Bakiye} - \text{Anlık Bakiye}}{\text{Zirve Bakiye}} \right)$$
    En yüksek Profit Factor ve en düşük Max Drawdown üreten parametre kümesi seçilir.
-4. **Hot-Reload Güncellemesi:** Yeni parametreler anında `config.json`a yazılır. Ana bot yeniden başlatılmaya gerek kalmadan yeni ayarlara geçer.
-5. **Telegram Raporu:**
+5. **Hot-Reload Güncellemesi:** Yeni parametreler anında `config.json`a yazılır. Ana bot yeniden başlatılmaya gerek kalmadan yeni ayarlara geçer.
+6. **Telegram Raporu:**
    ```
    ⚙️ *HAFTALIK MODEL GÜNCELLENDİ*
-   Son 14 gün analiz edildi.
+   Son 5m verileri analiz edildi.
    Yeni Hacim Eşiği: 3.5x
    Yeni Stop-Loss: %3.0
    Yeni Trailing TP: %3.0 (Delta: %0.6)
@@ -61,43 +67,66 @@ Sabit parametreli botlar değişen piyasa rejimlerinde verimsizleşir. Bu bot, p
 
 ---
 
-## 🎯 4. Canlı Piyasa Tarayıcısı ve Sinyal Filtreleri (`bot.py`)
+## 🎯 4. Canlı Piyasa Tarayıcısı ve 5 Kademeli Sinyal Filtresi (`bot.py`)
 
-Bot her 60 saniyede bir en hacimli 25 pariteyi 3 kademeli teyit filtresiyle süzer:
+Bot her 60 saniyede bir en hacimli 25 pariteyi süzer. Sahte kırılımları (fake-out) ve tuzakları engellemek için **5 kademeli teyit filtresi** uygulanır:
 
 1. **5 Dakikalık Hacim Anomalisi:**
    $$\text{Hacim}_{5m} > \text{SMA}(20, \text{Hacim}) \times \text{config["volume\_multiplier"]}$$
    Mumun yeşil (yükseliş) olması şarttır (`Close > Open`).
-2. **Açık Pozisyon (OI) Teyidi:**
+2. **Taker Alıcı Baskısı (Taker Buy Ratio):**
+   $$\frac{\text{Taker Buy Hacmi}}{\text{Toplam Hacim}} \ge 0.55 \quad (\%55)$$
+   Hacim patlamasının piyasa yapıcı emirlerle değil, piyasayı agresif süpüren gerçek alıcılarla (market buy) oluştuğu doğrulanır.
+3. **Mum Kapanış Gücü (Upper Wick Reddi):**
+   $$\text{Kapanış Gücü} = \frac{\text{Close} - \text{Low}}{\text{High} - \text{Low}} \ge 0.60 \quad (\%60)$$
+   Mumun üstünde uzun fitil (satıcı baskısı) kalmamış olması, kapanışın mum tepe noktasına yakın gerçekleşmesi şarttır.
+4. **Açık Pozisyon (OI) Teyidi:**
    Son 15 dakikada Open Interest artışı $\ge \%2.0$ olmalıdır. Hacim artarken OI artıyorsa piyasaya "taze kurumsal para" girdiği teyit edilir.
-3. **Duyarlılık (Top Trader L/S) Filtresi:**
-   Top Trader Long/Short oranı $\le 2.2$ olmalıdır. Oran 2.2 üzerindeyse piyasa aşırı kalabalık long pozisyondadır (Long Squeeze riski yüksektir) ve sinyal reddedilir.
-4. **Cooldown (Soğuma):**
+5. **Duyarlılık (Top Trader L/S) Filtresi:**
+   Top Trader Long/Short oranı $\le 2.2$ olmalıdır. Oran 2.2 üzerindeyse piyasa aşırı kalabalık long pozisyondadır (Long Squeeze riski) ve sinyal reddedilir.
+6. **Otomatik TradFi & Emtia Engeli:**
+   Binance'in `exchangeInfo` meta verilerindeki `TRADIFI_PERPETUAL` sözleşmeleri ve petrol/altın/endeks varlıkları (`BZUSDT`, `XAUUSDT`, `XAGUSDT`, `SOXLUSDT` vb.) düşük kripto volatilitesi sebebiyle baştan taranmaz.
+7. **Cooldown (Soğuma):**
    Bir coinde sinyal üretildikten sonra 30 dakika boyunca o pariteden yeni işlem açılmaz.
-5. **Kara Liste (Blacklist) Filtresi:**
-   Geleneksel emtialar (BZUSDT Brent petrol, XAUUSDT / PAXGUSDT altın), sabit coinler (USDC, FDUSD, TUSD) ve döviz türevleri (EURUSDT) düşük beta ve volatiliteye sahip oldukları için doğrudan elenir. Bot yalnızca yüksek dalga boyuna sahip saf kripto varlıkları analiz eder.
 
 ---
 
-## 📈 5. Sanal İşlem Yönetimi ve Çıkış Algoritması
+## 📈 5. Pozisyon Yönetimi, Break-Even ve Gerçekçi Komisyon Hesabı
 
 Sinyal geldiğinde anlık piyasa fiyatından sanal LONG açılır (**Sınırsız Eşzamanlı İşlem & Sabit 100 USDT Büyüklük**):
 
-- **Sabit İşlem Tutarı:** Her işlem sanal olarak tam **100 USDT** tutarında açılır. Kripto miktarı `100 / Giriş Fiyatı` formülüyle otomatik hesaplanır.
-- **Sınırsız İşlem Limiti:** `max_concurrent_positions: 0` olarak ayarlanmıştır. Kriterleri sağlayan tüm pariteler aynı anda bağımsız sanal pozisyon olarak açılabilir. (Aynı pariteye 30 dakika soğuma kuralı geçerliliğini korur).
-- **Stop-Loss:** Fiyat giriş seviyesinden `%config["stop_loss_pct"]` kadar düşerse anında pozisyon kapatılır.
+- **Sabit 100 USDT Kasa Boyutu:** Her işlem sanal olarak tam **100 USDT** tutarında açılır. Kripto miktarı `100 / Giriş Fiyatı` formülüyle otomatik hesaplanır.
+- **Sınırsız İşlem Modu:** `max_concurrent_positions: 0` olarak ayarlandığında, kriterleri sağlayan tüm pariteler bağımsız slotlar halinde eşzamanlı açılır.
+- **🛡️ Break-Even Koruma (Başa Baş Stop):**
+  - Fiyat kârda **+%1.50** (`break_even_trigger_pct`) seviyesine ulaştığında stop seviyesi otomatik olarak girişin **+%0.20** üzerine (`break_even_lock_pct`) çekilir.
+  - Böylece işlem riskten arındırılır; borsa komisyonu garanti altına alınır ve pozisyonun zararla kapanma ihtimali sıfırlanır. Telegram'a özel bildirim atılır.
 - **Trailing Take-Profit:**
-  - Fiyat `%config["trailing_trigger_pct"]` kadar kâra ulaştığında Trailing Stop **aktifleşir**.
-  - Aktifleştiği andan itibaren ulaşılan zirve fiyat (`peak_price`) hafızaya alınır.
-  - Fiyat zirveden `%config["trailing_delta_pct"]` kadar gerilerse kâr realizasyonu yapılarak pozisyon kapatılır.
+  - Fiyat `%config["trailing_trigger_pct"]` kâra ulaştığında Trailing Stop devreye girer.
+  - Ulaşılan tepe fiyattan geriye doğru `%config["trailing_delta_pct"]` kadar sarktığında kâr realizasyonu yapılır.
 - **Zaman Aşımı (Timeout):**
-  - Pozisyon 40 dakika içinde kapanmazsa momentumun kaybolduğu kabul edilir ("Hacim Söndü") ve anlık fiyattan kapatılır.
-- **Deftere Kayıt:**
-  Kapanan her işlem `paper_trades.csv`ye hem yüzdesel kâr/zarar (`pnl_pct`) hem de dolar bazında net kâr/zarar (`pnl_usd`) olarak eklenir ve Telegram'a bildirilir.
+  - Pozisyon 40 dakika içinde TP veya SL olmadıysa momentumun kaybolduğu kabul edilir ("Hacim Söndü") ve anlık fiyattan kapatılır.
+- **💸 Gerçekçi Borsa Komisyonu (%0.12 Roundtrip):**
+  - Gerçek vadeli piyasalarda %0.05 Taker alış + %0.05 Taker satış + ortalama %0.02 slippage bulunur.
+  - Bot her kapanan işlemden net `%0.12` komisyon düşerek `paper_trades.csv`ye ve Telegram'a **Net PnL** olarak yansıtır.
+- **💾 Durum Kalıcılığı (State Persistence):**
+  - Açık pozisyonlar anlık olarak `active_positions.json` dosyasına yazılır.
+  - Bot kapatılıp açılsa bile hafıza kaybı yaşanmaz; açık sanal pozisyonlar kaldığı yerden takip edilmeye devam eder.
 
 ---
 
-## 🚀 6. Detaylı Kurulum ve Çalıştırma Kılavuzu
+## 💬 6. Telegram Çift Yönlü İnteraktif Komutlar
+
+Telegram botunuz sadece bildirim göndermekle kalmaz, Telegram üzerinden yazdığınız komutlara anında yanıt verir:
+
+| Komut | Açıklama | Örnek Çıktı |
+|---|---|---|
+| `/durum` | Açıkta olan tüm sanal pozisyonları, giriş fiyatlarını, anlık kâr/zarar durumlarını ve Break-Even statülerini listeler. | `📊 Aktif Pozisyonlar (2 adet): ETHUSDT: % +1.82 (BE Aktif) ...` |
+| `/rapor` | `paper_trades.csv` defterini tarayarak toplam işlem sayısı, Win Rate (Kazanma Oranı), Toplam Net Dolar ve Yüzdesel PnL özetini sunar. | `📈 Paper Trading Raporu: Toplam İşlem: 14, Win Rate: %71.4, Net Kasa: +12.45$` |
+| `/yardim` | Kullanılabilir bot komutlarını ve açıklamalarını listeler. | Komut listesi ve kılavuz. |
+
+---
+
+## 🚀 7. Detaylı Kurulum ve Çalıştırma Kılavuzu
 
 ### Adım 1: Depoyu Klonlama veya Proje Dizinine Geçiş
 ```bash
@@ -106,7 +135,7 @@ cd binance-quant-bot
 ```
 
 ### Adım 2: Python Sanal Ortamını Hazırlama
-Proje Python 3.10, 3.11 veya 3.12 sürümleriyle tam uyumludur:
+Proje Python 3.10, 3.11, 3.12, 3.13 ve 3.14 sürümleriyle tam uyumludur:
 ```bash
 python3 -m venv .venv
 
@@ -120,10 +149,9 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-*(Eğer sisteminizde `uv` kuruluysa doğrudan `uv venv --python 3.12 .venv && uv pip install -r requirements.txt` şeklinde saniyeler içinde kurabilirsiniz).*
+*(Eğer sisteminizde `uv` kuruluysa doğrudan `uv venv --python 3.12 .venv && uv pip install -r requirements.txt` komutuyla 1 saniyede kurabilirsiniz).*
 
-### Adım 3: Telegram ve İşlem Parametrelerini Ayarlama
-`config.json` dosyasını açarak Telegram bilgilerinizi kontrol edin:
+### Adım 3: Konfigürasyon Ayarları (`config.json`)
 ```json
 {
     "volume_multiplier": 3.5,
@@ -138,33 +166,27 @@ pip install -r requirements.txt
     "top_pairs_count": 25,
     "oi_min_increase_pct": 2.0,
     "top_trader_ls_max": 2.2,
+    "min_taker_buy_ratio": 0.55,
+    "min_close_strength": 0.60,
+    "break_even_trigger_pct": 1.5,
+    "break_even_lock_pct": 0.2,
+    "commission_pct": 0.12,
     "telegram_token": "YOUR_TELEGRAM_BOT_TOKEN",
     "telegram_chat_id": "YOUR_TELEGRAM_CHAT_ID"
 }
 ```
 
 ### Adım 4: Model Optimizasyonu (İsteğe Bağlı Manuel Çalıştırma)
-Modeli son 14 günlük canlı piyasa verileri üzerinde test etmek ve en iyi parametreleri bulmak için:
 ```bash
-source .venv/bin/activate
-python optimizer.py
+.venv/bin/python optimizer.py
 ```
-Bu işlem 81 kombinasyonu saniyeler içinde simüle eder, `config.json` dosyasını otomatik günceller ve Telegram'a rapor iletir.
+81 farklı parametre kombinasyonunu 5m verileri üzerinde komisyon kesintili simüle eder, `config.json` dosyasını otomatik günceller ve Telegram'a özet iletir.
 
 ### Adım 5: Canlı Paper Trading Botunu Başlatma
 
-#### Yöntem 1: Doğrudan Sanal Ortam Python'u ile Çalıştırma (Önerilen - Tüm Kabuklar / Fish & Bash ile Uyumlu)
+#### Doğrudan Sanal Ortam Python'u ile Başlatma (Fish & Bash Uyumlu):
 ```bash
 .venv/bin/python bot.py
-```
-
-#### Yöntem 2: Sanal Ortamı Aktif Ederek Çalıştırma
-```bash
-# Bash / Zsh:
-source .venv/bin/activate && python bot.py
-
-# Fish Shell:
-source .venv/bin/activate.fish; and python bot.py
 ```
 
 #### Arka Planda Sürekli Çalıştırma (nohup):
@@ -172,9 +194,8 @@ Terminali kapatsanız dahi botun çalışmaya devam etmesi için:
 ```bash
 nohup .venv/bin/python bot.py > bot_stdout.log 2>&1 &
 ```
-Çalışan işlemi görmek için:
+Logları canlı takip etmek için:
 ```bash
-ps aux | grep bot.py
 tail -f bot.log
 ```
 Durdurmak için:
@@ -182,27 +203,19 @@ Durdurmak için:
 pkill -f bot.py
 ```
 
-#### `tmux` veya `screen` ile Çalıştırma:
+#### `tmux` ile Çalıştırma:
 ```bash
 tmux new -s quantbot
-source .venv/bin/activate
-python bot.py
+.venv/bin/python bot.py
 ```
-*(Ayrılmak için `Ctrl+B` ardından `D` tuşuna basabilirsiniz. Geri dönmek için: `tmux attach -t quantbot`).*
+*(Ayrılmak için `Ctrl+B` ardından `D` tuşuna basın. Geri bağlanmak için: `tmux attach -t quantbot`).*
 
 ---
 
-## 📊 7. İşlem Raporlarını İnceleme
+## 📊 8. İşlem Raporlarını İnceleme
 
-Kapanan tüm işlemler anında `paper_trades.csv` dosyasına yazılır.
-CSV dosyasını incelemek için:
+Kapanan tüm işlemler komisyon kesintili olarak `paper_trades.csv`ye yazılır:
 ```bash
 cat paper_trades.csv
 ```
-Veya pandas ile hızlı özet almak için:
-```python
-import pandas as pd
-df = pd.read_csv("paper_trades.csv")
-print(df.tail(10))
-print("Toplam PnL: %", df["pnl_pct"].sum())
-```
+Veya Telegram üzerinden botunuza doğrudan `/rapor` yazarak tüm istatistiklerinizi anlık olarak alabilirsiniz.

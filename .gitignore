@@ -14,6 +14,7 @@ __pycache__/
 # Runtime Logs
 *.log
 bot.log
+active_positions.json
 
 # OS generated files
 .DS_Store

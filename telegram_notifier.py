@@ -49,6 +49,42 @@ class TelegramNotifier:
             logger.error("Telegram API bağlantı hatası: %s", e)
             return False
 
+    def get_updates(self, offset: Optional[int] = None, timeout: int = 2) -> list:
+        """
+        Telegram gelen komut ve mesajları kontrol eder (/durum, /rapor vb.).
+        """
+        if not self.token:
+            return []
+        url = f"{self.base_url}/getUpdates"
+        params: Dict[str, Any] = {"timeout": timeout}
+        if offset is not None:
+            params["offset"] = offset
+
+        try:
+            resp = requests.get(url, params=params, timeout=timeout + 5)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("ok"):
+                    return data.get("result", [])
+        except Exception:
+            pass
+        return []
+
+    def notify_break_even(self, symbol: str, entry_price: float, peak_pnl: float) -> bool:
+        """
+        Break-Even (Başabaş) koruma tetiklendiğinde bilgilendirme atar.
+        """
+        fmt = ".4f" if entry_price < 10 else ".2f"
+        text = (
+            f"🛡️ *BAŞABAŞ (BREAK-EVEN) AKTİF: {symbol}*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Giriş Fiyatı: `${entry_price:{fmt}}`\n"
+            f"Zirve Kâr: `+%{peak_pnl:.2f}`\n\n"
+            "✅ *Stop-Loss seviyesi giriş fiyatının üzerine (+%0.20 net kâr) taşındı.*\n"
+            "Bu işlem artık zararla kapanamaz."
+        )
+        return self.send_message(text)
+
     def notify_model_updated(self, best_params: Dict[str, Any], stats: Dict[str, Any]) -> bool:
         """
         Optimizasyon tamamlandığında gönderilen model güncelleme kartı.
@@ -161,7 +197,7 @@ class TelegramNotifier:
             f"📤 Çıkış Fiyatı: `${exit_price:{fmt}}`\n"
             f"💵 İşlem Büyüklüğü: `${amount_usdt:.2f} USDT`\n\n"
             "📈 *İşlem Performansı:*\n"
-            f"• Net P/L: *%{pnl_pct:+.2f}* (*${pnl_usd:+.2f} USDT*) {pnl_emoji}\n"
+            f"• Net P/L (Komisyon Düşüldü): *%{pnl_pct:+.2f}* (*${pnl_usd:+.2f} USDT*) {pnl_emoji}\n"
             f"• İşlem Süresi: `{duration:.1f} dakika`\n"
             f"• Görülen Zirve Kâr: `%{peak_pnl:+.2f}`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -188,11 +224,14 @@ class TelegramNotifier:
             f"• Hacim Eşiği: `{config.get('volume_multiplier', 2.8)}x SMA(20)`\n"
             f"• Stop-Loss: `%{config.get('stop_loss_pct', 2.0)}`\n"
             f"• Trailing TP: `%{config.get('trailing_trigger_pct', 3.0)}` (Delta: `%{config.get('trailing_delta_pct', 1.0)}`)\n"
+            f"• Break-Even (Başabaş): `+%{config.get('break_even_trigger_pct', 1.5)} kârda aktif` 🛡️\n"
+            f"• Taker Komisyon Hesabı: `%{config.get('commission_pct', 0.12)} / işlem` 🏷️\n"
             f"• 15m OI Filtresi: `>= %{config.get('oi_min_increase_pct', 2.0)}`\n"
             f"• L/S Oran Filtresi: `<= {config.get('top_trader_ls_max', 2.2)}`\n"
             f"• Zaman Aşımı: `{config.get('position_timeout_minutes', 40)} dk`\n"
             f"• Tarama Periyodu: `{config.get('scan_interval_seconds', 60)} sn`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💬 *Komutlar:* `/durum` (Açık işlemler), `/rapor` (İşlem karnesi)\n"
             "🚀 Canlı piyasa taraması başlatıldı..."
         )
         return self.send_message(text)

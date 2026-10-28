@@ -2,18 +2,18 @@
 bot.py
 ======
 Binance USDT-M Vadeli İşlemler Canlı Piyasa Tarayıcısı,
-Sanal Pozisyon Yöneticisi (Paper Trading) ve Telegram Bildirim Botu.
+Sanal Pozisyon Yöneticisi (Paper Trading) ve Telegram İnteraktif Bildirim Botu.
 
 Özellikler:
-- config.json dosyasını her döngüde okur (Hot-Reload).
-- Başlangıçta konfigürasyon yoksa veya eskimişse optimizer.py'ı tetikler.
-- Haftada bir otomatik Walk-Forward yeniden optimizasyon planlar.
-- En hacimli ilk 25 pariteyi 60 saniyede bir tarar.
-- 3'lü Teyit: 5m Hacim Anomalisi + 15m OI Artışı >= %2.0 + Top Trader L/S <= 2.2.
-- 30 dakika parite soğuma (cooldown).
-- Maksimum 2 eşzamanlı sanal LONG pozisyonu yönetir.
-- Trailing Take-Profit, Stop-Loss ve 40 dakikalık Zaman Aşımı çıkışları uygular.
-- paper_trades.csv dosyasına kayıt tutar ve Telegram'a emojili kartlar iletir.
+- Saf pandas kullanımı (pandas-ta / numba gereksinimi kaldırıldı).
+- State Persistence: Açık pozisyonlar active_positions.json dosyasına kaydedilir (Restart/Reboot koruması).
+- Hot-Reload: config.json sadece dosya değiştirilme zamanı (mtime) değiştiğinde okunur.
+- Batch Fiyat Güncellemesi: Tek HTTP isteğiyle tüm pozisyon fiyatları anlık güncellenir.
+- Başabaş (Break-Even) Stop: +%1.5 kâr görüldüğünde Stop-Loss otomatik olarak girişin üzerine (+%0.20 net kâr) taşınır.
+- Gerçekçi Borsa Komisyonu: %0.12 Taker komisyonu ve kayma (slippage) her işlemden otomatik düşülür.
+- Taker Buy Volume (%55+) ve Üst Fitil (Fakeout / Rejection %60+) filtreleri.
+- Otomatik TradFi (Emtia/Hisse/ETF) eleme ve 60 saniyede bir canlı güncellenen Top 25 kripto tarayıcısı.
+- Telegram İnteraktif Komut Dinleyicisi (/durum, /rapor, /yardim).
 """
 
 import os
@@ -34,7 +34,6 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Any
 
 import pandas as pd
-import pandas_ta as ta
 
 from binance_client import BinanceFuturesClient
 from telegram_notifier import TelegramNotifier
@@ -53,6 +52,7 @@ logging.basicConfig(
 logger = logging.getLogger("QuantBot")
 
 CSV_PATH = os.path.join(SCRIPT_DIR, "paper_trades.csv")
+POSITIONS_PATH = os.path.join(SCRIPT_DIR, "active_positions.json")
 
 
 @dataclass
@@ -70,11 +70,16 @@ class Position:
     amount_usdt: float = 100.0
     qty: float = 0.0
     trailing_active: bool = False
+    break_even_active: bool = False
     peak_price: float = 0.0
     peak_pnl_pct: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Position":
+        return cls(**data)
 
 
 class PaperTradingBot:
@@ -82,13 +87,15 @@ class PaperTradingBot:
         self.is_running = True
         self.client = BinanceFuturesClient()
         self.config = load_config()
+        self._last_config_mtime: float = os.path.getmtime(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else 0.0
+
         self.notifier = TelegramNotifier(
             token=self.config.get("telegram_token", ""),
             chat_id=self.config.get("telegram_chat_id", "")
         )
 
-        # Aktif sanal pozisyonlar: symbol -> Position
-        self.active_positions: Dict[str, Position] = {}
+        # Aktif sanal pozisyonlar: symbol -> Position (Diskten yükle)
+        self.active_positions: Dict[str, Position] = self._load_positions_from_disk()
 
         # Sinyal soğuma süreleri: symbol -> timestamp
         self.cooldowns: Dict[str, float] = {}
@@ -104,7 +111,7 @@ class PaperTradingBot:
         """paper_trades.csv yoksa veya kolonları eksikse günceller."""
         columns = [
             "timestamp", "symbol", "side", "entry_price", "exit_price",
-            "qty", "amount_usdt", "pnl_pct", "pnl_usd",
+            "qty", "amount_usdt", "pnl_pct", "pnl_usd", "commission_usd",
             "duration_minutes", "exit_reason", "peak_pnl_pct"
         ]
         if not os.path.exists(CSV_PATH):
@@ -114,39 +121,75 @@ class PaperTradingBot:
         else:
             try:
                 existing = pd.read_csv(CSV_PATH)
-                if "amount_usdt" not in existing.columns:
-                    df = pd.DataFrame(columns=columns)
-                    df.to_csv(CSV_PATH, index=False, encoding="utf-8")
-                    logger.info("paper_trades.csv başlıkları $100 tutar formatına güncellendi.")
+                if "commission_usd" not in existing.columns:
+                    # Yeni kolonları ekle
+                    for col in columns:
+                        if col not in existing.columns:
+                            existing[col] = 0.0
+                    existing.to_csv(CSV_PATH, index=False, encoding="utf-8")
             except Exception:
                 pass
+
+    def _load_positions_from_disk(self) -> Dict[str, Position]:
+        """Bot yeniden başladığında açık pozisyonları active_positions.json'dan okur."""
+        positions = {}
+        if os.path.exists(POSITIONS_PATH):
+            try:
+                with open(POSITIONS_PATH, "r", encoding="utf-8") as f:
+                    raw_data = json.load(f)
+                    for sym, pos_data in raw_data.items():
+                        positions[sym] = Position.from_dict(pos_data)
+                if positions:
+                    logger.info("📁 Kayıtlı %d adet açık pozisyon diskten yüklendi: %s",
+                                len(positions), list(positions.keys()))
+            except Exception as e:
+                logger.error("active_positions.json okuma hatası: %s", e)
+        return positions
+
+    def _save_positions_to_disk(self) -> None:
+        """Açık pozisyonları anlık olarak active_positions.json'a yazar."""
+        try:
+            data = {sym: pos.to_dict() for sym, pos in self.active_positions.items()}
+            with open(POSITIONS_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error("active_positions.json yazma hatası: %s", e)
 
     def _log_trade_to_csv(self, trade_record: Dict[str, Any]) -> None:
         """Kapanan işlemi paper_trades.csv dosyasına ekler."""
         try:
             df = pd.DataFrame([trade_record])
             df.to_csv(CSV_PATH, mode="a", header=False, index=False, encoding="utf-8")
-            logger.info("İşlem CSV defterine kaydedildi: %s | PnL: %%%.2f",
-                        trade_record["symbol"], trade_record["pnl_pct"])
+            logger.info("İşlem CSV defterine kaydedildi: %s | Net PnL: %%%.2f ($%.2f USDT)",
+                        trade_record["symbol"], trade_record["pnl_pct"], trade_record["pnl_usd"])
         except Exception as e:
             logger.error("CSV kayıt hatası: %s", e)
 
     def _handle_exit(self, signum, frame) -> None:
-        """Bot kapatılırken açık pozisyonları güvenle loglar."""
-        logger.info("Kapatma sinyali alındı. Bot durduruluyor...")
+        """Bot kapatılırken açık pozisyonları güvenle diske kaydeder."""
+        logger.info("Kapatma sinyali alındı. Açık pozisyonlar diske kaydediliyor...")
+        self._save_positions_to_disk()
         self.is_running = False
 
     def reload_config_if_changed(self) -> None:
         """
-        Hot-Reload: config.json dosyasını her döngüde yeniden okur.
-        Parametre değiştiğinde botu yeniden başlatmadan anında aktif eder.
+        Hot-Reload: config.json dosyasını sadece mtime değiştiğinde okur (Disk I/O tasarrufu).
         """
+        if not os.path.exists(CONFIG_PATH):
+            return
+
         try:
+            current_mtime = os.path.getmtime(CONFIG_PATH)
+            if current_mtime == self._last_config_mtime:
+                return  # Dosya değişmemiş, CPU ve disk harcama
+
+            self._last_config_mtime = current_mtime
             new_cfg = load_config()
-            # Önemli parametreler değiştiyse logla
+
             keys_to_compare = [
                 "volume_multiplier", "stop_loss_pct", "trailing_trigger_pct",
-                "trailing_delta_pct", "max_concurrent_positions", "oi_min_increase_pct", "top_trader_ls_max"
+                "trailing_delta_pct", "max_concurrent_positions", "trade_amount_usdt",
+                "break_even_trigger_pct", "commission_pct", "oi_min_increase_pct", "top_trader_ls_max"
             ]
             changes = []
             for k in keys_to_compare:
@@ -164,7 +207,7 @@ class PaperTradingBot:
 
     def startup_check_and_optimize(self) -> None:
         """
-        Başlangıçta config.json'ın varlığını ve güncelliğini kontrol eder.
+        Başlangıçta config.json'ın güncelliğini kontrol eder.
         Gerekirse doğrudan hızlı bir başlangıç optimizasyonu yapar.
         """
         last_opt = self.config.get("last_optimized_at")
@@ -187,19 +230,17 @@ class PaperTradingBot:
             try:
                 logger.info("Başlangıç optimizasyonu çalıştırılıyor...")
                 run_optimization()
+                self._last_config_mtime = 0.0  # Reload'ı tetikle
                 self.reload_config_if_changed()
             except Exception as e:
                 logger.error("Başlangıç optimizasyonu hatası: %s. Mevcut ayarlar kullanılıyor.", e)
 
     def start_weekly_optimizer_thread(self) -> None:
-        """
-        Arka planda haftada bir (7 günde bir) çalışan bağımsız optimizasyon iş parçacığı.
-        """
+        """Haftada bir arka planda çalışan otomatik optimizasyon iş parçacığı."""
         def weekly_loop():
             logger.info("Haftalık arka plan optimizasyon izleyicisi aktif.")
             while self.is_running:
-                # 6 saatte bir kontrol et
-                time.sleep(21600)
+                time.sleep(21600)  # 6 saatte bir kontrol et
                 if not self.is_running:
                     break
                 try:
@@ -210,6 +251,7 @@ class PaperTradingBot:
                         if diff_days >= 7.0:
                             logger.info("📅 7 gün doldu. Otomatik haftalık optimizasyon başlatılıyor...")
                             run_optimization()
+                            self._last_config_mtime = 0.0
                             self.reload_config_if_changed()
                 except Exception as e:
                     logger.error("Haftalık optimizasyon döngüsü hatası: %s", e)
@@ -217,45 +259,166 @@ class PaperTradingBot:
         t = threading.Thread(target=weekly_loop, daemon=True, name="WeeklyOptimizerThread")
         t.start()
 
+    def start_telegram_command_listener(self) -> None:
+        """
+        Telegram üzerinden gelen /durum, /rapor, /yardim komutlarını dinler ve yanıtlar.
+        """
+        def telegram_loop():
+            logger.info("Telegram interaktif komut dinleyicisi başlatıldı (/durum, /rapor).")
+            last_update_id = None
+            while self.is_running:
+                try:
+                    updates = self.notifier.get_updates(offset=last_update_id, timeout=2)
+                    for update in updates:
+                        last_update_id = update["update_id"] + 1
+                        message = update.get("message", {})
+                        text = message.get("text", "").strip()
+                        chat_id = str(message.get("chat", {}).get("id", ""))
+
+                        # Sadece yetkili chat_id'den gelen komutları kabul et
+                        if chat_id != str(self.notifier.chat_id):
+                            continue
+
+                        if text == "/durum":
+                            self._handle_cmd_status()
+                        elif text == "/rapor":
+                            self._handle_cmd_report()
+                        elif text in ["/yardim", "/help", "/start"]:
+                            help_msg = (
+                                "🤖 *Binance Quant Bot Komutları:*\n"
+                                "━━━━━━━━━━━━━━━━━━━━━\n"
+                                "• `/durum` - Açık sanal pozisyonları ve anlık PnL durumunu gösterir\n"
+                                "• `/rapor` - Genel kâr/zarar ve işlem performans özetini döner\n"
+                                "• `/yardim` - Bu menüyü gösterir"
+                            )
+                            self.notifier.send_message(help_msg)
+                except Exception as e:
+                    logger.debug("Telegram dinleyici hatası: %s", e)
+                time.sleep(2)
+
+        t = threading.Thread(target=telegram_loop, daemon=True, name="TelegramListenerThread")
+        t.start()
+
+    def _handle_cmd_status(self) -> None:
+        """/durum komutu: Açık pozisyonları özetler."""
+        if not self.active_positions:
+            self.notifier.send_message("ℹ️ Şu anda açık sanal pozisyon bulunmuyor.")
+            return
+
+        all_prices = self.client.get_all_prices()
+        lines = ["📊 *AKTİF SANAL POZİSYONLAR:*", "━━━━━━━━━━━━━━━━━━━━━"]
+        now = time.time()
+
+        for sym, pos in self.active_positions.items():
+            curr_p = all_prices.get(sym) or pos.entry_price
+            pnl = ((curr_p - pos.entry_price) / pos.entry_price) * 100.0
+            pnl_usd = pos.amount_usdt * (pnl / 100.0)
+            duration = (now - pos.entry_time) / 60.0
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            be_str = " (🛡️ BE Aktif)" if pos.break_even_active else ""
+            tr_str = " (🎯 Trailing Aktif)" if pos.trailing_active else ""
+
+            lines.append(
+                f"{emoji} *{sym}*: `${curr_p:.4f}` | PnL: *%{pnl:+.2f}* (*${pnl_usd:+.2f}*)\n"
+                f"   ↳ Giriş: `${pos.entry_price:.4f}` | Süre: `{duration:.1f} dk`{be_str}{tr_str}"
+            )
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        self.notifier.send_message("\n".join(lines))
+
+    def _handle_cmd_report(self) -> None:
+        """/rapor komutu: paper_trades.csv üzerinden genel işlem karnesini döner."""
+        if not os.path.exists(CSV_PATH):
+            self.notifier.send_message("ℹ️ Henüz tamamlanmış işlem kaydı bulunmuyor.")
+            return
+
+        try:
+            df = pd.read_csv(CSV_PATH)
+            if df.empty:
+                self.notifier.send_message("ℹ️ Henüz tamamlanmış işlem kaydı bulunmuyor.")
+                return
+
+            total_trades = len(df)
+            winning = df[df["pnl_pct"] > 0]
+            losing = df[df["pnl_pct"] <= 0]
+
+            win_rate = (len(winning) / total_trades) * 100.0 if total_trades > 0 else 0.0
+            total_pnl_usd = df["pnl_usd"].sum() if "pnl_usd" in df.columns else (df["pnl_pct"].sum())
+            total_comm_usd = df["commission_usd"].sum() if "commission_usd" in df.columns else 0.0
+
+            best_trade = df["pnl_pct"].max()
+            worst_trade = df["pnl_pct"].min()
+
+            msg = (
+                "📈 *GENEL PAPER TRADING PERFORMANS RAPORU*\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                f"• Toplam Tamamlanan İşlem: `{total_trades}` adet\n"
+                f"• Kazanma Oranı (Win Rate): `%{win_rate:.1f}`\n"
+                f"• Kazançlı / Kayıplı: `{len(winning)}` / `{len(losing)}`\n"
+                f"• Net Toplam Kâr/Zarar: *${total_pnl_usd:+.2f} USDT*\n"
+                f"• Ödenen Sanal Komisyon: `${total_comm_usd:.2f} USDT`\n"
+                f"• En İyi İşlem: `%{best_trade:+.2f}`\n"
+                f"• En Kötü İşlem: `%{worst_trade:+.2f}`\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "📁 Detaylar: `paper_trades.csv`"
+            )
+            self.notifier.send_message(msg)
+        except Exception as e:
+            self.notifier.send_message(f"⚠️ Rapor hesaplanırken hata oluştu: {e}")
+
     def update_and_check_positions(self) -> None:
         """
         Açık sanal pozisyonları günceller:
-        1. Stop-Loss kontrolü
-        2. Trailing TP kontrolü
-        3. 40 dakikalık Zaman Aşımı ("Hacim Söndü") kontrolü
+        - Batch fiyat çekme (tek HTTP isteği ile tüm coinlerin fiyatı güncellenir).
+        - Break-Even (Başabaş) kontrolü (+%1.5 görüldüyse stop girişe çekilir).
+        - Stop-Loss, Trailing TP ve Zaman Aşımı kontrolleri.
+        - Komisyon düşülmüş net PnL hesabı.
         """
         if not self.active_positions:
             return
 
         symbols_to_close = []
         now = time.time()
+        commission_pct = float(self.config.get("commission_pct", 0.12))
+        be_trigger = float(self.config.get("break_even_trigger_pct", 1.5))
+        be_lock = float(self.config.get("break_even_lock_pct", 0.20))
+
+        # Tek seferde tüm fiyatları çek (Batch Update - Rate limit tasarrufu)
+        all_prices = self.client.get_all_prices()
 
         for symbol, pos in list(self.active_positions.items()):
-            curr_price = self.client.get_latest_price(symbol)
+            curr_price = all_prices.get(symbol) or self.client.get_latest_price(symbol)
             if curr_price is None or curr_price <= 0:
                 continue
 
             entry_price = pos.entry_price
-            pnl_pct = ((curr_price - entry_price) / entry_price) * 100.0
+            raw_pnl_pct = ((curr_price - entry_price) / entry_price) * 100.0
             duration_minutes = (now - pos.entry_time) / 60.0
 
             # 1. Zirve fiyat ve kâr takibi
             if curr_price > pos.peak_price:
                 pos.peak_price = curr_price
-                pos.peak_pnl_pct = pnl_pct
+                pos.peak_pnl_pct = raw_pnl_pct
 
-            # 2. Trailing TP Tetikleme Kontrolü
+            # 2. Başabaş (Break-Even) Koruma Kontrolü
+            if not pos.break_even_active and pos.peak_pnl_pct >= be_trigger:
+                pos.break_even_active = True
+                pos.sl_pct = -be_lock  # Stop-loss'u girişin üzerine (+%0.20 net kâra) taşı
+                logger.info("🛡️ [%s] Break-Even Aktifleşti! Zirve: %%%.2f | Yeni Stop Seviyesi: +%%%.2f",
+                            symbol, pos.peak_pnl_pct, be_lock)
+                self.notifier.notify_break_even(symbol, entry_price, pos.peak_pnl_pct)
+
+            # 3. Trailing TP Tetikleme Kontrolü
             if not pos.trailing_active and pos.peak_pnl_pct >= pos.tp_trigger_pct:
                 pos.trailing_active = True
                 logger.info("🎯 [%s] Trailing TP Aktifleşti! Zirve Kâr: %%%.2f", symbol, pos.peak_pnl_pct)
 
-            # 3. Çıkış Koşulları Değerlendirmesi
+            # 4. Çıkış Koşulları Değerlendirmesi
             exit_reason = None
             exit_price = curr_price
 
-            # Koşul A: Stop-Loss
-            if pnl_pct <= -pos.sl_pct:
-                exit_reason = "STOP_LOSS"
+            # Koşul A: Stop-Loss (veya Break-Even Stop)
+            if raw_pnl_pct <= -pos.sl_pct:
+                exit_reason = "BREAK_EVEN" if pos.break_even_active else "STOP_LOSS"
                 exit_price = entry_price * (1.0 - pos.sl_pct / 100.0)
 
             # Koşul B: Trailing Stop Gerçekleşmesi
@@ -272,8 +435,11 @@ class PaperTradingBot:
 
             # Kapanış gerekiyorsa uygula
             if exit_reason:
-                final_pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0
-                pnl_usd = pos.amount_usdt * (final_pnl_pct / 100.0)
+                gross_pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0
+                net_pnl_pct = gross_pnl_pct - commission_pct
+                net_pnl_usd = pos.amount_usdt * (net_pnl_pct / 100.0)
+                comm_usd = pos.amount_usdt * (commission_pct / 100.0)
+
                 trade_record = {
                     "timestamp": datetime.now().isoformat(),
                     "symbol": symbol,
@@ -282,30 +448,35 @@ class PaperTradingBot:
                     "exit_price": round(exit_price, 6),
                     "qty": round(pos.qty, 6),
                     "amount_usdt": round(pos.amount_usdt, 2),
-                    "pnl_pct": round(final_pnl_pct, 2),
-                    "pnl_usd": round(pnl_usd, 2),
+                    "pnl_pct": round(net_pnl_pct, 2),
+                    "pnl_usd": round(net_pnl_usd, 2),
+                    "commission_usd": round(comm_usd, 2),
                     "duration_minutes": round(duration_minutes, 1),
                     "exit_reason": exit_reason,
                     "peak_pnl_pct": round(pos.peak_pnl_pct, 2)
                 }
 
-                logger.info("🔴 [%s Pozisyon Kapatıldı] Neden: %s | PnL: %%%.2f ($%.2f USDT) | Süre: %.1f dk",
-                            symbol, exit_reason, final_pnl_pct, pnl_usd, duration_minutes)
+                logger.info("🔴 [%s Pozisyon Kapatıldı] Neden: %s | Net PnL: %%%.2f ($%.2f USDT) | Süre: %.1f dk",
+                            symbol, exit_reason, net_pnl_pct, net_pnl_usd, duration_minutes)
 
                 self._log_trade_to_csv(trade_record)
                 self.notifier.notify_trade_closed(trade_record)
                 symbols_to_close.append(symbol)
 
-        for sym in symbols_to_close:
-            self.active_positions.pop(sym, None)
+        if symbols_to_close:
+            for sym in symbols_to_close:
+                self.active_positions.pop(sym, None)
+            self._save_positions_to_disk()
 
     def scan_market(self) -> None:
         """
-        En hacimli 25 pariteyi tarar ve 3 sinyal filtresini değerlendirir:
+        En hacimli 25 saf kripto paritesini tarar ve 5 kademeli teyit filtresini değerlendirir:
         1. 5m Mum Hacmi > SMA(20) * volume_multiplier (Anomali)
-        2. Son 15 dakikada Open Interest artışı >= %2.0 (Taze para teyidi)
-        3. Top Trader L/S Oranı <= 2.2 (Sıkışma/Kalabalık long riski filtresi)
-        4. Cooldown: Aynı pariteye 30 dakika içinde ikinci sinyal üretilmez
+        2. Taker Buy Volume >= %55 (Gerçek agresif alıcı baskısı teyidi)
+        3. Mum Kapanış Gücü >= %60 (Üst fitil / fakeout / dumping eleme)
+        4. Son 15 dakikada Open Interest artışı >= %2.0 (Taze kurumsal para teyidi)
+        5. Top Trader L/S Oranı <= 2.2 (Sıkışma/Kalabalık long riski filtresi)
+        6. Cooldown: Aynı pariteye 30 dakika içinde ikinci sinyal üretilmez
         """
         max_positions = int(self.config.get("max_concurrent_positions", 0))
         is_unlimited = (max_positions <= 0)
@@ -328,6 +499,8 @@ class PaperTradingBot:
         vol_mult_threshold = float(self.config.get("volume_multiplier", 2.8))
         min_oi_increase = float(self.config.get("oi_min_increase_pct", 2.0))
         max_ls_ratio = float(self.config.get("top_trader_ls_max", 2.2))
+        min_taker_ratio = float(self.config.get("min_taker_buy_ratio", 0.55))
+        min_close_str = float(self.config.get("min_close_strength", 0.60))
 
         for symbol in top_pairs:
             if not self.is_running:
@@ -347,31 +520,45 @@ class PaperTradingBot:
                 if elapsed < cooldown_sec:
                     continue
 
-            # 1. Filtre: 5m Hacim Anomalisi
+            # 1. Filtre: 5m Hacim Anomalisi ve Mum Formasyonu
             df = self.client.get_klines(symbol, interval="5m", limit=30)
             if df is None or len(df) < 25:
                 continue
 
-            df["vol_sma"] = ta.sma(df["volume"], length=20)
+            df["vol_sma"] = df["volume"].rolling(window=20).mean()
             last_candle = df.iloc[-1]
             prev_candle = df.iloc[-2]
 
-            # Son kapanan veya anlık mumda anomali kontrolü
-            candle_to_check = last_candle if (last_candle["close"] > last_candle["open"]) else prev_candle
-            vol_sma = candle_to_check["vol_sma"]
+            # Kapanmış mum teyidi veya güçlü anlık mum
+            candle = last_candle if (last_candle["close"] > last_candle["open"]) else prev_candle
+            vol_sma = candle["vol_sma"]
             if pd.isna(vol_sma) or vol_sma <= 0:
                 continue
 
-            actual_vol_mult = candle_to_check["volume"] / vol_sma
-            is_bullish = candle_to_check["close"] > candle_to_check["open"]
+            actual_vol_mult = candle["volume"] / vol_sma
+            is_bullish = candle["close"] > candle["open"]
 
             if not (is_bullish and actual_vol_mult >= vol_mult_threshold):
                 continue
 
-            logger.info("🚨 [HACİM ANOMALİSİ TESPİT EDİLDİ] %s: Hacim %.2fx SMA(20) (Eşik: %.2fx)",
-                        symbol, actual_vol_mult, vol_mult_threshold)
+            # 2. Filtre: Taker Buy Volume (Alıcı Baskısı Oranı >= %55)
+            taker_vol = float(candle.get("taker_buy_volume", 0.0))
+            taker_ratio = (taker_vol / candle["volume"]) if candle["volume"] > 0 else 0.0
+            if taker_ratio < min_taker_ratio:
+                logger.debug("[%s] Alıcı baskısı yetersiz: %%%.1f < %%%.1f", symbol, taker_ratio * 100, min_taker_ratio * 100)
+                continue
 
-            # 2. Filtre: 15m Açık Pozisyon (OI) Artışı >= %2.0
+            # 3. Filtre: Üst Fitil / Fakeout Reddi (Kapanış Gücü >= %60)
+            candle_range = candle["high"] - candle["low"]
+            close_strength = ((candle["close"] - candle["low"]) / candle_range) if candle_range > 0 else 1.0
+            if close_strength < min_close_str:
+                logger.debug("[%s] Üstten satış iğnesi yemiş: güç %%%.1f < %%%.1f", symbol, close_strength * 100, min_close_str * 100)
+                continue
+
+            logger.info("🚨 [HACİM ANOMALİSİ + ALICI BASKISI TESPİT EDİLDİ] %s: Hacim %.2fx SMA(20) | Alıcı: %%%.1f | Kapanış Gücü: %%%.1f",
+                        symbol, actual_vol_mult, taker_ratio * 100, close_strength * 100)
+
+            # 4. Filtre: 15m Açık Pozisyon (OI) Artışı >= %2.0
             oi_change = self.client.get_open_interest_change(symbol)
             if oi_change is None:
                 logger.debug("[%s] OI verisi alınamadı, atlanıyor.", symbol)
@@ -385,7 +572,7 @@ class PaperTradingBot:
             logger.info("  ↳ [%s] OI Teyidi BAŞARILI: +%%%.2f (Taze para girişi doğrulandı) 🟢",
                         symbol, oi_change)
 
-            # 3. Filtre: Top Trader Long/Short Oranı <= 2.2
+            # 5. Filtre: Top Trader Long/Short Oranı <= 2.2
             ls_ratio = self.client.get_top_trader_long_short_ratio(symbol)
             if ls_ratio is None:
                 logger.debug("[%s] L/S oranı verisi alınamadı, atlanıyor.", symbol)
@@ -399,8 +586,8 @@ class PaperTradingBot:
             logger.info("  ↳ [%s] L/S Teyidi BAŞARILI: %.2f <= %.2f (Aşırı kalabalık değil) 🟢",
                         symbol, ls_ratio, max_ls_ratio)
 
-            # TÜM 3 FİLTRE SAĞLANDI -> SANAL LONG AÇ
-            entry_price = float(last_candle["close"])
+            # TÜM 5 FİLTRE SAĞLANDI -> SANAL LONG AÇ
+            entry_price = float(candle["close"])
             sl_pct = float(self.config.get("stop_loss_pct", 2.0))
             tp_pct = float(self.config.get("trailing_trigger_pct", 3.0))
             delta_pct = float(self.config.get("trailing_delta_pct", 1.0))
@@ -425,12 +612,14 @@ class PaperTradingBot:
                 amount_usdt=trade_amount_usdt,
                 qty=qty,
                 trailing_active=False,
+                break_even_active=False,
                 peak_price=entry_price,
                 peak_pnl_pct=0.0
             )
 
             self.active_positions[symbol] = new_pos
             self.cooldowns[symbol] = now  # 30 dk soğuma başlat
+            self._save_positions_to_disk()  # Diske anlık kaydet
 
             logger.info("✅ [YENİ SANAL LONG] %s @ $%.4f ($%.2f USDT, Miktar: %.4f) | SL: $%.4f | Trailing: $%.4f",
                         symbol, entry_price, trade_amount_usdt, qty, sl_price, tp_trigger_price)
@@ -470,6 +659,9 @@ class PaperTradingBot:
         # 3. Haftalık Arka Plan Optimizatörünü Başlat
         self.start_weekly_optimizer_thread()
 
+        # 4. Telegram İnteraktif Komut Dinleyicisini Başlat (/durum, /rapor)
+        self.start_telegram_command_listener()
+
         scan_interval = int(self.config.get("scan_interval_seconds", 60))
         last_scan_time = 0.0
 
@@ -477,10 +669,10 @@ class PaperTradingBot:
 
         while self.is_running:
             try:
-                # Hot-Reload kontrolü
+                # Hot-Reload kontrolü (Sadece mtime değiştiğinde)
                 self.reload_config_if_changed()
 
-                # Pozisyon Takibi (Sık aralıklarla kâr/zarar ve çıkış değerlendirme)
+                # Pozisyon Takibi (Batch fiyat güncellemesiyle kâr/zarar ve çıkış değerlendirme)
                 self.update_and_check_positions()
 
                 now = time.time()
@@ -491,7 +683,7 @@ class PaperTradingBot:
                     self.scan_market()
                     last_scan_time = now
 
-                # Kısa aralıklarla döngüyü sürdür (pozisyon takibinin gecikmemesi için 5 sn)
+                # Pozisyon takibinin gecikmemesi için 5 sn bekleme
                 time.sleep(5)
 
             except Exception as e:
