@@ -1,0 +1,22 @@
+[Unit]
+Description=Binance Quant Walk-Forward Paper Trading Bot
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Sunucunuzdaki kullanıcı adı (örn: ubuntu, root veya debian)
+User=root
+# Botun kurulu olduğu dizin yolu
+WorkingDirectory=/root/binance-quant-bot
+# Sanal ortamdaki Python ile botun başlatılması
+ExecStart=/root/binance-quant-bot/.venv/bin/python /root/binance-quant-bot/bot.py
+Restart=always
+RestartSec=10
+KillMode=process
+TimeoutStopSec=30
+StandardOutput=append:/root/binance-quant-bot/bot.log
+StandardError=append:/root/binance-quant-bot/bot.log
+
+[Install]
+WantedBy=multi-user.target

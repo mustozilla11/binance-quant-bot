@@ -1,0 +1,11 @@
+services:
+  binance-quant-bot:
+    build: .
+    container_name: binance-quant-bot
+    restart: unless-stopped
+    volumes:
+      - ./config.json:/app/config.json
+      - ./paper_trades.csv:/app/paper_trades.csv
+      - ./bot.log:/app/bot.log
+    environment:
+      - PYTHONUNBUFFERED=1
