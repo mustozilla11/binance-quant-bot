@@ -67,6 +67,8 @@ class Position:
     tp_trigger_pct: float
     tp_delta_pct: float
     timeout_minutes: int
+    amount_usdt: float = 100.0
+    qty: float = 0.0
     trailing_active: bool = False
     peak_price: float = 0.0
     peak_pnl_pct: float = 0.0
@@ -99,14 +101,25 @@ class PaperTradingBot:
         signal.signal(signal.SIGTERM, self._handle_exit)
 
     def _init_csv(self) -> None:
-        """paper_trades.csv yoksa başlıkları oluşturur."""
+        """paper_trades.csv yoksa veya kolonları eksikse günceller."""
+        columns = [
+            "timestamp", "symbol", "side", "entry_price", "exit_price",
+            "qty", "amount_usdt", "pnl_pct", "pnl_usd",
+            "duration_minutes", "exit_reason", "peak_pnl_pct"
+        ]
         if not os.path.exists(CSV_PATH):
-            df = pd.DataFrame(columns=[
-                "timestamp", "symbol", "side", "entry_price", "exit_price",
-                "pnl_pct", "duration_minutes", "exit_reason", "peak_pnl_pct"
-            ])
+            df = pd.DataFrame(columns=columns)
             df.to_csv(CSV_PATH, index=False, encoding="utf-8")
             logger.info("paper_trades.csv dosyası oluşturuldu.")
+        else:
+            try:
+                existing = pd.read_csv(CSV_PATH)
+                if "amount_usdt" not in existing.columns:
+                    df = pd.DataFrame(columns=columns)
+                    df.to_csv(CSV_PATH, index=False, encoding="utf-8")
+                    logger.info("paper_trades.csv başlıkları $100 tutar formatına güncellendi.")
+            except Exception:
+                pass
 
     def _log_trade_to_csv(self, trade_record: Dict[str, Any]) -> None:
         """Kapanan işlemi paper_trades.csv dosyasına ekler."""
@@ -260,20 +273,24 @@ class PaperTradingBot:
             # Kapanış gerekiyorsa uygula
             if exit_reason:
                 final_pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0
+                pnl_usd = pos.amount_usdt * (final_pnl_pct / 100.0)
                 trade_record = {
                     "timestamp": datetime.now().isoformat(),
                     "symbol": symbol,
                     "side": "LONG",
                     "entry_price": round(entry_price, 6),
                     "exit_price": round(exit_price, 6),
+                    "qty": round(pos.qty, 6),
+                    "amount_usdt": round(pos.amount_usdt, 2),
                     "pnl_pct": round(final_pnl_pct, 2),
+                    "pnl_usd": round(pnl_usd, 2),
                     "duration_minutes": round(duration_minutes, 1),
                     "exit_reason": exit_reason,
                     "peak_pnl_pct": round(pos.peak_pnl_pct, 2)
                 }
 
-                logger.info("🔴 [%s Pozisyon Kapatıldı] Neden: %s | PnL: %%%.2f | Süre: %.1f dk",
-                            symbol, exit_reason, final_pnl_pct, duration_minutes)
+                logger.info("🔴 [%s Pozisyon Kapatıldı] Neden: %s | PnL: %%%.2f ($%.2f USDT) | Süre: %.1f dk",
+                            symbol, exit_reason, final_pnl_pct, pnl_usd, duration_minutes)
 
                 self._log_trade_to_csv(trade_record)
                 self.notifier.notify_trade_closed(trade_record)
@@ -290,17 +307,20 @@ class PaperTradingBot:
         3. Top Trader L/S Oranı <= 2.2 (Sıkışma/Kalabalık long riski filtresi)
         4. Cooldown: Aynı pariteye 30 dakika içinde ikinci sinyal üretilmez
         """
-        max_positions = int(self.config.get("max_concurrent_positions", 2))
+        max_positions = int(self.config.get("max_concurrent_positions", 0))
+        is_unlimited = (max_positions <= 0)
         current_open = len(self.active_positions)
 
-        if current_open >= max_positions:
+        if not is_unlimited and current_open >= max_positions:
             logger.info("Maksimum eşzamanlı pozisyon sayısına ulaşıldı (%d/%d). Yeni tarama atlanıyor.",
                         current_open, max_positions)
             return
 
         top_n = int(self.config.get("top_pairs_count", 25))
         top_pairs = self.client.get_top_volume_pairs(limit=top_n)
-        logger.info("Piyasa taranıyor: Top %d hacimli vadeli parite analiz ediliyor...", len(top_pairs))
+        lim_str = "Sınırsız (Unlimited)" if is_unlimited else f"{current_open}/{max_positions}"
+        logger.info("Piyasa taranıyor: Top %d parite analiz ediliyor (Açık Pozisyonlar: %d | Limit: %s)...",
+                    len(top_pairs), current_open, lim_str)
 
         now = time.time()
         cooldown_sec = float(self.config.get("cooldown_minutes", 30)) * 60.0
@@ -380,6 +400,8 @@ class PaperTradingBot:
             tp_pct = float(self.config.get("trailing_trigger_pct", 3.0))
             delta_pct = float(self.config.get("trailing_delta_pct", 1.0))
             timeout_m = int(self.config.get("position_timeout_minutes", 40))
+            trade_amount_usdt = float(self.config.get("trade_amount_usdt", 100.0))
+            qty = (trade_amount_usdt / entry_price) if entry_price > 0 else 0.0
 
             sl_price = entry_price * (1.0 - sl_pct / 100.0)
             tp_trigger_price = entry_price * (1.0 + tp_pct / 100.0)
@@ -395,6 +417,8 @@ class PaperTradingBot:
                 tp_trigger_pct=tp_pct,
                 tp_delta_pct=delta_pct,
                 timeout_minutes=timeout_m,
+                amount_usdt=trade_amount_usdt,
+                qty=qty,
                 trailing_active=False,
                 peak_price=entry_price,
                 peak_pnl_pct=0.0
@@ -403,8 +427,8 @@ class PaperTradingBot:
             self.active_positions[symbol] = new_pos
             self.cooldowns[symbol] = now  # 30 dk soğuma başlat
 
-            logger.info("✅ [YENİ SANAL LONG] %s @ $%.4f | SL: $%.4f | Trailing Tetik: $%.4f",
-                        symbol, entry_price, sl_price, tp_trigger_price)
+            logger.info("✅ [YENİ SANAL LONG] %s @ $%.4f ($%.2f USDT, Miktar: %.4f) | SL: $%.4f | Trailing: $%.4f",
+                        symbol, entry_price, trade_amount_usdt, qty, sl_price, tp_trigger_price)
 
             # Telegram Sinyal Kartı İlet
             self.notifier.notify_signal_card(
@@ -418,8 +442,8 @@ class PaperTradingBot:
                 config=self.config
             )
 
-            # Eşzamanlı pozisyon limitine ulaşıldıysa bu turu bitir
-            if len(self.active_positions) >= max_positions:
+            # Eşzamanlı pozisyon limiti varsa ve ulaşıldıysa bu turu bitir
+            if not is_unlimited and len(self.active_positions) >= max_positions:
                 break
 
             time.sleep(0.5)

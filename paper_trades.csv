@@ -1,1 +1,1 @@
-timestamp,symbol,side,entry_price,exit_price,pnl_pct,duration_minutes,exit_reason,peak_pnl_pct
+timestamp,symbol,side,entry_price,exit_price,qty,amount_usdt,pnl_pct,pnl_usd,duration_minutes,exit_reason,peak_pnl_pct

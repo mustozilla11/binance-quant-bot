@@ -79,8 +79,10 @@ Bot her 60 saniyede bir en hacimli 25 pariteyi 3 kademeli teyit filtresiyle süz
 
 ## 📈 5. Sanal İşlem Yönetimi ve Çıkış Algoritması
 
-Sinyal geldiğinde anlık piyasa fiyatından sanal LONG açılır (Maksimum 2 eşzamanlı işlem):
+Sinyal geldiğinde anlık piyasa fiyatından sanal LONG açılır (**Sınırsız Eşzamanlı İşlem & Sabit 100 USDT Büyüklük**):
 
+- **Sabit İşlem Tutarı:** Her işlem sanal olarak tam **100 USDT** tutarında açılır. Kripto miktarı `100 / Giriş Fiyatı` formülüyle otomatik hesaplanır.
+- **Sınırsız İşlem Limiti:** `max_concurrent_positions: 0` olarak ayarlanmıştır. Kriterleri sağlayan tüm pariteler aynı anda bağımsız sanal pozisyon olarak açılabilir. (Aynı pariteye 30 dakika soğuma kuralı geçerliliğini korur).
 - **Stop-Loss:** Fiyat giriş seviyesinden `%config["stop_loss_pct"]` kadar düşerse anında pozisyon kapatılır.
 - **Trailing Take-Profit:**
   - Fiyat `%config["trailing_trigger_pct"]` kadar kâra ulaştığında Trailing Stop **aktifleşir**.
@@ -89,7 +91,7 @@ Sinyal geldiğinde anlık piyasa fiyatından sanal LONG açılır (Maksimum 2 e�
 - **Zaman Aşımı (Timeout):**
   - Pozisyon 40 dakika içinde kapanmazsa momentumun kaybolduğu kabul edilir ("Hacim Söndü") ve anlık fiyattan kapatılır.
 - **Deftere Kayıt:**
-  Kapanan her işlem `paper_trades.csv`ye eklenir ve kâr/zarar sonucu Telegram'a bildirilir.
+  Kapanan her işlem `paper_trades.csv`ye hem yüzdesel kâr/zarar (`pnl_pct`) hem de dolar bazında net kâr/zarar (`pnl_usd`) olarak eklenir ve Telegram'a bildirilir.
 
 ---
 
@@ -120,7 +122,8 @@ pip install -r requirements.txt
     "stop_loss_pct": 3.0,
     "trailing_trigger_pct": 3.0,
     "trailing_delta_pct": 0.6,
-    "max_concurrent_positions": 2,
+    "max_concurrent_positions": 0,
+    "trade_amount_usdt": 100.0,
     "position_timeout_minutes": 40,
     "cooldown_minutes": 30,
     "scan_interval_seconds": 60,

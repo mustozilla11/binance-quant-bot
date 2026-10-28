@@ -104,15 +104,21 @@ class TelegramNotifier:
         delta_pct = config.get("trailing_delta_pct", 1.0)
         timeout_m = config.get("position_timeout_minutes", 40)
         max_ls = config.get("top_trader_ls_max", 2.2)
+        trade_amount = float(config.get("trade_amount_usdt", 100.0))
+        qty = (trade_amount / entry_price) if entry_price > 0 else 0.0
 
         # Fiyat formatlama (kuruş hassasiyeti)
         fmt = ".4f" if entry_price < 10 else ".2f"
+        qty_fmt = ".2f" if qty >= 10 else (".4f" if qty >= 0.1 else ".6f")
+        base_coin = symbol.replace("USDT", "")
 
         text = (
             "🟢 *YENİ SANAL LONG SİNYALİ AÇILDI*\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🪙 Parite: *{symbol}*\n"
-            f"💵 Giriş Fiyatı: `${entry_price:{fmt}}`\n\n"
+            f"💵 Giriş Fiyatı: `${entry_price:{fmt}}`\n"
+            f"💰 Pozisyon Tutarı: *${trade_amount:.2f} USDT*\n"
+            f"📦 Sanal Miktar: *{qty:{qty_fmt}} {base_coin}*\n\n"
             "📊 *Anomali ve Teyit Metrikleri:*\n"
             f"• 5m Hacim Artışı: *{vol_mult:.2f}x SMA(20)* 🚀\n"
             f"• 15m Açık Pozisyon (OI): *+%{oi_change:.2f}* 🟢\n"
@@ -123,7 +129,7 @@ class TelegramNotifier:
             f"• Trailing Delta: `%{delta_pct}` (Zirveden çekilme)\n"
             f"• Zaman Aşımı: `{timeout_m} Dakika`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "⚡ *Paper Trading Modu:* Emir sanal deftere işlendi."
+            "⚡ *Paper Trading Modu:* $100'lık sanal emir deftere işlendi."
         )
         return self.send_message(text)
 
@@ -135,6 +141,8 @@ class TelegramNotifier:
         entry_price = trade_info["entry_price"]
         exit_price = trade_info["exit_price"]
         pnl_pct = trade_info["pnl_pct"]
+        pnl_usd = trade_info.get("pnl_usd", 0.0)
+        amount_usdt = trade_info.get("amount_usdt", 100.0)
         duration = trade_info.get("duration_minutes", 0)
         reason = trade_info.get("exit_reason", "Bilinmiyor")
         peak_pnl = trade_info.get("peak_pnl_pct", 0.0)
@@ -150,9 +158,10 @@ class TelegramNotifier:
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📌 Kapanış Nedeni: *{reason}*\n"
             f"📥 Giriş Fiyatı: `${entry_price:{fmt}}`\n"
-            f"📤 Çıkış Fiyatı: `${exit_price:{fmt}}`\n\n"
+            f"📤 Çıkış Fiyatı: `${exit_price:{fmt}}`\n"
+            f"💵 İşlem Büyüklüğü: `${amount_usdt:.2f} USDT`\n\n"
             "📈 *İşlem Performansı:*\n"
-            f"• Net P/L: *%{pnl_pct:+.2f}* ({pnl_emoji})\n"
+            f"• Net P/L: *%{pnl_pct:+.2f}* (*${pnl_usd:+.2f} USDT*) {pnl_emoji}\n"
             f"• İşlem Süresi: `{duration:.1f} dakika`\n"
             f"• Görülen Zirve Kâr: `%{peak_pnl:+.2f}`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -164,18 +173,23 @@ class TelegramNotifier:
         """
         Bot başladığında Telegram'a durum özeti gönderir.
         """
+        max_pos = config.get("max_concurrent_positions", 0)
+        max_pos_str = "Sınırsız (Unlimited) ♾️" if (not max_pos or int(max_pos) <= 0) else f"{max_pos} adet"
+        trade_amt = float(config.get("trade_amount_usdt", 100.0))
+
         text = (
             "🤖 *BINANCE QUANT BOT AKTİF EDİLDİ*\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "Mode: *Paper Trading (USDT-M Vadeli)*\n"
             "Mimari: *Walk-Forward Self-Optimizing*\n\n"
             "📋 *Aktif Parametreler (config.json):*\n"
+            f"• Sabit İşlem Büyüklüğü: `${trade_amt:.2f} USDT / işlem` 💵\n"
+            f"• Eşzamanlı İşlem Limiti: `{max_pos_str}`\n"
             f"• Hacim Eşiği: `{config.get('volume_multiplier', 2.8)}x SMA(20)`\n"
             f"• Stop-Loss: `%{config.get('stop_loss_pct', 2.0)}`\n"
             f"• Trailing TP: `%{config.get('trailing_trigger_pct', 3.0)}` (Delta: `%{config.get('trailing_delta_pct', 1.0)}`)\n"
             f"• 15m OI Filtresi: `>= %{config.get('oi_min_increase_pct', 2.0)}`\n"
             f"• L/S Oran Filtresi: `<= {config.get('top_trader_ls_max', 2.2)}`\n"
-            f"• Eşzamanlı Maks Pozisyon: `{config.get('max_concurrent_positions', 2)}`\n"
             f"• Zaman Aşımı: `{config.get('position_timeout_minutes', 40)} dk`\n"
             f"• Tarama Periyodu: `{config.get('scan_interval_seconds', 60)} sn`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
