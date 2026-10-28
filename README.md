@@ -107,7 +107,13 @@ cd binance-quant-bot
 Proje Python 3.10, 3.11 veya 3.12 sürümleriyle tam uyumludur:
 ```bash
 python3 -m venv .venv
+
+# Bash / Zsh kullanıcıları için:
 source .venv/bin/activate
+
+# Fish Shell kullanıcıları için:
+source .venv/bin/activate.fish
+
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
@@ -145,17 +151,24 @@ Bu işlem 81 kombinasyonu saniyeler içinde simüle eder, `config.json` dosyası
 
 ### Adım 5: Canlı Paper Trading Botunu Başlatma
 
-#### Normal Çalıştırma (Terminalde İzleme):
+#### Yöntem 1: Doğrudan Sanal Ortam Python'u ile Çalıştırma (Önerilen - Tüm Kabuklar / Fish & Bash ile Uyumlu)
 ```bash
-source .venv/bin/activate
-python bot.py
+.venv/bin/python bot.py
+```
+
+#### Yöntem 2: Sanal Ortamı Aktif Ederek Çalıştırma
+```bash
+# Bash / Zsh:
+source .venv/bin/activate && python bot.py
+
+# Fish Shell:
+source .venv/bin/activate.fish; and python bot.py
 ```
 
 #### Arka Planda Sürekli Çalıştırma (nohup):
 Terminali kapatsanız dahi botun çalışmaya devam etmesi için:
 ```bash
-source .venv/bin/activate
-nohup python bot.py > bot_stdout.log 2>&1 &
+nohup .venv/bin/python bot.py > bot_stdout.log 2>&1 &
 ```
 Çalışan işlemi görmek için:
 ```bash
