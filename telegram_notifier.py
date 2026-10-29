@@ -70,17 +70,19 @@ class TelegramNotifier:
             pass
         return []
 
-    def notify_break_even(self, symbol: str, entry_price: float, peak_pnl: float) -> bool:
+    def notify_break_even(self, symbol: str, entry_price: float, peak_pnl: float, side: str = "LONG") -> bool:
         """
         Break-Even (Başabaş) koruma tetiklendiğinde bilgilendirme atar.
         """
         fmt = ".4f" if entry_price < 10 else ".2f"
+        side_upper = side.upper()
+        dir_text = "altına (-%0.20 net kâra)" if side_upper == "SHORT" else "üzerine (+%0.20 net kâra)"
         text = (
-            f"🛡️ *BAŞABAŞ (BREAK-EVEN) AKTİF: {symbol}*\n"
+            f"🛡️ *BAŞABAŞ (BREAK-EVEN) AKTİF: {symbol} ({side_upper})*\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Giriş Fiyatı: `${entry_price:{fmt}}`\n"
             f"Zirve Kâr: `+%{peak_pnl:.2f}`\n\n"
-            "✅ *Stop-Loss seviyesi giriş fiyatının üzerine (+%0.20 net kâr) taşındı.*\n"
+            f"✅ *Stop-Loss seviyesi giriş fiyatının {dir_text} taşındı.*\n"
             "Bu işlem artık zararla kapanamaz."
         )
         return self.send_message(text)
@@ -131,18 +133,23 @@ class TelegramNotifier:
         sl_price: float,
         tp_trigger_price: float,
         config: Dict[str, Any],
-        structure_info: Optional[Dict[str, Any]] = None
+        structure_info: Optional[Dict[str, Any]] = None,
+        side: str = "LONG"
     ) -> bool:
         """
-        Canlı piyasa tarayıcısından 3 kriter sağlandığında atılan görsel sinyal kartı.
+        Canlı piyasa tarayıcısından kriterler sağlandığında atılan görsel sinyal kartı (LONG / SHORT).
         """
         sl_pct = config.get("stop_loss_pct", 2.0)
         tp_pct = config.get("trailing_trigger_pct", 3.0)
         delta_pct = config.get("trailing_delta_pct", 1.0)
         timeout_m = config.get("position_timeout_minutes", 40)
         max_ls = config.get("top_trader_ls_max", 2.2)
+        min_ls = config.get("top_trader_ls_min", 0.65)
         trade_amount = float(config.get("trade_amount_usdt", 100.0))
         qty = (trade_amount / entry_price) if entry_price > 0 else 0.0
+
+        side_upper = side.upper()
+        is_short = (side_upper == "SHORT")
 
         # Fiyat formatlama (kuruş hassasiyeti)
         fmt = ".4f" if entry_price < 10 else ".2f"
@@ -159,36 +166,48 @@ class TelegramNotifier:
             trend_dir = structure_info.get("trend_direction", "Bilinmiyor")
             trend_slope = structure_info.get("trend_slope_hourly_pct", 0.0)
             is_breakout = structure_info.get("is_breakout", False)
+            is_breakdown = structure_info.get("is_breakdown", False)
 
-            sup_str = f"${nearest_sup:{fmt}} (-%{sup_dist:.2f})" if nearest_sup else "Bulunamadı"
-            res_str = f"${nearest_res:{fmt}} (+%{res_dist:.2f})" if nearest_res else "Açık Yol (Hedef Serbest)"
+            sup_str = f"${nearest_sup:{fmt}} (-%{sup_dist:.2f})" if nearest_sup else "Açık Taban"
+            res_str = f"${nearest_res:{fmt}} (+%{res_dist:.2f})" if nearest_res else "Açık Tavan"
             poc_str = f"${poc_p:{fmt}}" if (poc_p and poc_p > 0) else "Yok"
-            breakout_tag = " ⚡ *[DİRENÇ KIRILIMI]*" if is_breakout else ""
+
+            break_tag = ""
+            if is_breakout:
+                break_tag = " ⚡ *[DİRENÇ KIRILIMI - BREAKOUT]*"
+            elif is_breakdown:
+                break_tag = " ⚡ *[DESTEK KIRILIMI - BREAKDOWN]*"
 
             struct_section = (
-                f"🧱 *Piyasa Yapısı & Hacim Profili:*{breakout_tag}\n"
+                f"🧱 *Piyasa Yapısı & Hacim Profili:*{break_tag}\n"
                 f"• En Yakın Destek: `{sup_str}`\n"
                 f"• Hacim POC: `{poc_str}`\n"
-                f"• Üst Direnç Hedefi: `{res_str}`\n"
+                f"• En Yakın Direnç: `{res_str}`\n"
                 f"• Trend Yönü: *{trend_dir}* (`{trend_slope:+.2f}%/saat`)\n\n"
             )
 
+        title = "🔴 *YENİ SANAL SHORT SİNYALİ AÇILDI*" if is_short else "🟢 *YENİ SANAL LONG SİNYALİ AÇILDI*"
+        action_name = "SHORT (Düşüş Yönlü)" if is_short else "LONG (Yükseliş Yönlü)"
+        ls_rule = f">={min_ls}" if is_short else f"<={max_ls}"
+        sl_sign = "+" if is_short else "-"
+        tp_sign = "-" if is_short else "+"
+
         text = (
-            "🟢 *YENİ SANAL LONG SİNYALİ AÇILDI*\n"
+            f"{title}\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🪙 Parite: *{symbol}*\n"
+            f"🪙 Parite: *{symbol}* | Yön: *{action_name}*\n"
             f"💵 Giriş Fiyatı: `${entry_price:{fmt}}`\n"
             f"💰 Pozisyon Tutarı: *${trade_amount:.2f} USDT*\n"
             f"📦 Sanal Miktar: *{qty:{qty_fmt}} {base_coin}*\n\n"
             "📊 *Anomali ve Teyit Metrikleri:*\n"
             f"• 5m Hacim Artışı: *{vol_mult:.2f}x SMA(20)* 🚀\n"
             f"• 15m Açık Pozisyon (OI): *+%{oi_change:.2f}* 🟢\n"
-            f"• Top Trader L/S: *{ls_ratio:.2f}* (Kural: <= {max_ls})\n\n"
+            f"• Top Trader L/S: *{ls_ratio:.2f}* (Kural: {ls_rule})\n\n"
             f"{struct_section}"
             "🎯 *Pozisyon Çıkış Parametreleri:*\n"
-            f"• Stop-Loss (%{sl_pct}): `${sl_price:{fmt}}`\n"
-            f"• Trailing TP Tetik (%{tp_pct}): `${tp_trigger_price:{fmt}}`\n"
-            f"• Trailing Delta: `%{delta_pct}` (Zirveden çekilme)\n"
+            f"• Stop-Loss ({sl_sign}%{sl_pct}): `${sl_price:{fmt}}`\n"
+            f"• Trailing TP Tetik ({tp_sign}%{tp_pct}): `${tp_trigger_price:{fmt}}`\n"
+            f"• Trailing Delta: `%{delta_pct}` (Kârdan sarkma)\n"
             f"• Zaman Aşımı: `{timeout_m} Dakika`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "⚡ *Paper Trading Modu:* $100'lık sanal emir deftere işlendi."

@@ -8,8 +8,9 @@ Hacim Profili (Volume Profile - POC) ve Trend Doğrusu Analiz Modülü.
 - Fraktal Tepe/Dip (Swing High/Low) tespiti ve tolerans bantlı kümeleme.
 - Hacim Profili (Volume Profile) üzerinden Point of Control (POC) hesabı.
 - Lineer regresyon ile trend yönü ve saatlik eğim açısı tespiti.
-- 'Duvara Çarpma' (Room-to-Run) kontrolü ve Direnç Kırılım (Breakout) doğrulaması.
-- Yapısal Dinamik Kâr Alma (Take-Profit) ve Destek Arkası Zarar Durdurma (Stop-Loss) önerileri.
+- LONG için 'Duvara Çarpma' (Room-to-Resistance) ve Direnç Kırılım (Breakout) doğrulaması.
+- SHORT için 'Tabana Çarpma' (Room-to-Support) ve Destek Kırılım (Breakdown) doğrulaması.
+- Çift yönlü dinamik Kâr Alma (Take-Profit) ve yapısal Zarar Durdurma (Stop-Loss) önerileri.
 """
 
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ import pandas as pd
 @dataclass
 class MarketStructureResult:
     symbol: str
+    side: str                     # "LONG" veya "SHORT"
     current_price: float
     nearest_resistance: Optional[float]
     dist_to_resistance_pct: Optional[float]
@@ -30,17 +32,27 @@ class MarketStructureResult:
     poc_volume: float
     trend_direction: str          # "Yükselen Trend ↗", "Düşen Trend ↘", "Yatay Bant ↔"
     trend_slope_hourly_pct: float
-    is_breakout: bool
-    broken_resistance: Optional[float]
+    is_breakout: bool             # Direnç yukarı kırıldı mı? (LONG için)
+    is_breakdown: bool            # Destek aşağı kırıldı mı? (SHORT için)
+    broken_level: Optional[float]
     has_room_to_run: bool
     rejection_reason: Optional[str]
     suggested_tp_pct: float
     suggested_sl_pct: float
     all_levels: List[Dict[str, Any]]
 
+    @property
+    def broken_resistance(self) -> Optional[float]:
+        return self.broken_level if self.is_breakout else None
+
+    @property
+    def broken_support(self) -> Optional[float]:
+        return self.broken_level if self.is_breakdown else None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "symbol": self.symbol,
+            "side": self.side,
             "current_price": self.current_price,
             "nearest_resistance": self.nearest_resistance,
             "dist_to_resistance_pct": self.dist_to_resistance_pct,
@@ -51,7 +63,8 @@ class MarketStructureResult:
             "trend_direction": self.trend_direction,
             "trend_slope_hourly_pct": self.trend_slope_hourly_pct,
             "is_breakout": self.is_breakout,
-            "broken_resistance": self.broken_resistance,
+            "is_breakdown": self.is_breakdown,
+            "broken_level": self.broken_level,
             "has_room_to_run": self.has_room_to_run,
             "rejection_reason": self.rejection_reason,
             "suggested_tp_pct": self.suggested_tp_pct,
@@ -93,7 +106,6 @@ def find_sr_clusters(
         return []
 
     # 2. Tolerans Dahilinde Fiyat Kümelerine Birleştir
-    # Fiyata göre sırala
     pivots.sort(key=lambda x: x[1])
     clusters: List[List[Tuple[str, float]]] = []
 
@@ -101,7 +113,6 @@ def find_sr_clusters(
         matched = False
         for cluster in clusters:
             cluster_avg = sum(p[1] for p in cluster) / len(cluster)
-            # Yüzdesel mesafe tolerans içinde mi?
             if abs(price - cluster_avg) / cluster_avg * 100.0 <= tolerance_pct:
                 cluster.append((p_type, price))
                 matched = True
@@ -123,7 +134,6 @@ def find_sr_clusters(
                 "low_touches": low_touches
             })
 
-    # Test edilme sayısına (güce) göre azalan sırala
     levels.sort(key=lambda x: x["touches"], reverse=True)
     return levels
 
@@ -154,7 +164,6 @@ def calculate_volume_profile_poc(
     bin_edges = np.linspace(min_p, max_p, bins + 1)
     bin_vols = np.zeros(bins, dtype=float)
 
-    # Tipik fiyat üzerinden hacim dağılımı
     typical_prices = (highs + lows + closes) / 3.0
     bin_indices = np.digitize(typical_prices, bin_edges) - 1
     bin_indices = np.clip(bin_indices, 0, bins - 1)
@@ -188,8 +197,6 @@ def calculate_trend_slope(
     x = np.arange(n)
     try:
         slope, _ = np.polyfit(x, closes, 1)
-        # 5 dakikalık periyotta 12 mum = 1 saat.
-        # Saatlik bazda fiyata göre yüzde değişim eğimi:
         hourly_pct = (slope * 12.0 / closes[0]) * 100.0
         hourly_pct = round(float(hourly_pct), 2)
     except Exception:
@@ -210,24 +217,28 @@ def analyze_market_structure(
     df: pd.DataFrame,
     current_price: float,
     prev_close: Optional[float] = None,
+    side: str = "LONG",
     window: int = 5,
     tolerance_pct: float = 0.4,
     min_room_to_resistance_pct: float = 1.2,
+    min_room_to_support_pct: float = 1.2,
     default_tp_pct: float = 3.0,
     default_sl_pct: float = 2.0,
     dynamic_tp_enabled: bool = True,
     structural_sl_enabled: bool = True
 ) -> MarketStructureResult:
     """
-    Tüm piyasa yapısı bileşenlerini birleştirir:
+    Hem LONG hem de SHORT yönlü piyasa yapısı değerlendirmesi:
     - Destek/Direnç kümeleri
-    - POC seviyesi
-    - Trend eğimi
-    - Kırılım (Breakout) ve Duvara Çarpma (Room to Run) kontrolü
-    - Dinamik TP & Yapısal SL hesaplaması
+    - POC seviyesi & Trend eğimi
+    - LONG: Kırılım (Breakout) ve Duvara Çarpma (Room to Resistance) kontrolü
+    - SHORT: Kırılım (Breakdown) ve Tabana Çarpma (Room to Support) kontrolü
+    - Yöne duyarlı Dinamik TP & Yapısal SL hesaplaması
     """
     if current_price <= 0:
         current_price = float(df["close"].iloc[-1]) if (df is not None and len(df) > 0) else 1.0
+
+    side = side.upper()
 
     # 1. Kümeleri ve POC'yi çıkar
     levels = find_sr_clusters(df, window=window, tolerance_pct=tolerance_pct, min_touches=2)
@@ -238,10 +249,7 @@ def analyze_market_structure(
     resistances = [lvl for lvl in levels if lvl["price"] > current_price]
     supports = [lvl for lvl in levels if lvl["price"] < current_price]
 
-    # Fiyata en yakın olanlar:
-    # Dirençler: fiyattan büyükler arasında en küçük fiyatlısı
     nearest_res_obj = min(resistances, key=lambda x: x["price"]) if resistances else None
-    # Destekler: fiyattan küçükler arasında en büyük fiyatlısı
     nearest_sup_obj = max(supports, key=lambda x: x["price"]) if supports else None
 
     nearest_res = nearest_res_obj["price"] if nearest_res_obj else None
@@ -255,63 +263,96 @@ def analyze_market_structure(
     if nearest_sup is not None:
         dist_sup_pct = round(((current_price - nearest_sup) / current_price) * 100.0, 2)
 
-    # 3. Kırılım (Breakout) Tespiti
-    # Eğer önceki mum kapanışı bir direncin altındayken bu mum o direncin üzerine çıktıysa kırılımdır
+    # 3. Kırılım (Breakout / Breakdown) Tespiti
     is_breakout = False
-    broken_res = None
+    is_breakdown = False
+    broken_level = None
+
     if prev_close is not None and prev_close > 0:
         for lvl in levels:
             lvl_p = lvl["price"]
-            # Direnç seviyesi önceki kapanış ile mevcut fiyat arasında mı?
-            # Veya mevcut fiyat direncin %0.0 - %0.6 kadar hemen üzerinde mi?
-            if prev_close <= lvl_p <= current_price or (
-                current_price > lvl_p and ((current_price - lvl_p) / lvl_p * 100.0) <= 0.6
-            ):
-                is_breakout = True
-                broken_res = lvl_p
-                break
+            if side == "LONG":
+                # Direnç yukarı kırıldı mı?
+                if prev_close <= lvl_p <= current_price or (
+                    current_price > lvl_p and ((current_price - lvl_p) / lvl_p * 100.0) <= 0.6
+                ):
+                    is_breakout = True
+                    broken_level = lvl_p
+                    break
+            else:
+                # Destek aşağı kırıldı mı?
+                if prev_close >= lvl_p >= current_price or (
+                    current_price < lvl_p and ((lvl_p - current_price) / lvl_p * 100.0) <= 0.6
+                ):
+                    is_breakdown = True
+                    broken_level = lvl_p
+                    break
 
-    # 4. 'Duvara Çarpma' (Room-to-Run) Değerlendirmesi
+    # 4. 'Duvara / Tabana Çarpma' (Room-to-Run) Değerlendirmesi
     has_room = True
     rejection_reason = None
 
-    if nearest_res is not None and not is_breakout:
-        if dist_res_pct is not None and dist_res_pct < min_room_to_resistance_pct:
-            has_room = False
-            rejection_reason = (
-                f"Direnç Çok Yakın (+%{dist_res_pct:.2f} < +%{min_room_to_resistance_pct:.2f}). "
-                f"Duvara çarpma riski yüksek (Direnç: ${nearest_res:.4f})"
-            )
+    if side == "LONG":
+        if nearest_res is not None and not is_breakout:
+            if dist_res_pct is not None and dist_res_pct < min_room_to_resistance_pct:
+                has_room = False
+                rejection_reason = (
+                    f"Direnç Çok Yakın (+%{dist_res_pct:.2f} < +%{min_room_to_resistance_pct:.2f}). "
+                    f"Duvara çarpma riski yüksek (Direnç: ${nearest_res:.4f})"
+                )
+    else:
+        # SHORT: Altımızda çok yakın destek varsa tabana çarpıp sekme riski
+        if nearest_sup is not None and not is_breakdown:
+            if dist_sup_pct is not None and dist_sup_pct < min_room_to_support_pct:
+                has_room = False
+                rejection_reason = (
+                    f"Destek Çok Yakın (-%{dist_sup_pct:.2f} < -%{min_room_to_support_pct:.2f}). "
+                    f"Tabana çarpma riski yüksek (Destek: ${nearest_sup:.4f})"
+                )
 
     # 5. Dinamik TP (Take-Profit)
     suggested_tp = default_tp_pct
-    if dynamic_tp_enabled and nearest_res is not None and dist_res_pct is not None:
-        # Eğer direnç +%1.5 ile varsayılan TP arasındaysa, kârı direncin hemen altına kilitleriz
-        if 1.5 <= dist_res_pct <= default_tp_pct:
-            suggested_tp = max(1.5, round(dist_res_pct - 0.15, 2))
+    if dynamic_tp_enabled:
+        if side == "LONG" and nearest_res is not None and dist_res_pct is not None:
+            if 1.5 <= dist_res_pct <= default_tp_pct:
+                suggested_tp = max(1.5, round(dist_res_pct - 0.15, 2))
+        elif side == "SHORT" and nearest_sup is not None and dist_sup_pct is not None:
+            # Düşüşte kârı desteğin hemen üzerinde realize et
+            if 1.5 <= dist_sup_pct <= default_tp_pct:
+                suggested_tp = max(1.5, round(dist_sup_pct - 0.15, 2))
 
     # 6. Yapısal SL (Stop-Loss)
     suggested_sl = default_sl_pct
     if structural_sl_enabled:
-        # En yakın destek veya POC seviyesi girişin altındaysa koruyucu zemin kabul edilir
-        structural_floors = []
-        if nearest_sup is not None and dist_sup_pct is not None and 0.5 <= dist_sup_pct <= (default_sl_pct + 0.5):
-            structural_floors.append(dist_sup_pct)
-
-        if poc_price > 0 and poc_price < current_price:
-            poc_dist_pct = ((current_price - poc_price) / current_price) * 100.0
-            if 0.5 <= poc_dist_pct <= (default_sl_pct + 0.5):
-                structural_floors.append(poc_dist_pct)
-
-        if structural_floors:
-            # En yakın sağlam zeminin %0.20 altına stop koy
-            floor_dist = min(structural_floors)
-            calc_sl = round(floor_dist + 0.20, 2)
-            # Aşırı geniş stop'a izin verme, default_sl_pct ile sınırla
-            suggested_sl = min(default_sl_pct, max(1.0, calc_sl))
+        if side == "LONG":
+            structural_floors = []
+            if nearest_sup is not None and dist_sup_pct is not None and 0.5 <= dist_sup_pct <= (default_sl_pct + 0.5):
+                structural_floors.append(dist_sup_pct)
+            if 0 < poc_price < current_price:
+                poc_dist_pct = ((current_price - poc_price) / current_price) * 100.0
+                if 0.5 <= poc_dist_pct <= (default_sl_pct + 0.5):
+                    structural_floors.append(poc_dist_pct)
+            if structural_floors:
+                floor_dist = min(structural_floors)
+                calc_sl = round(floor_dist + 0.20, 2)
+                suggested_sl = min(default_sl_pct, max(1.0, calc_sl))
+        else:
+            # SHORT: Tavan (Direnç veya üstteki POC) stop seviyesi olarak kullanılır
+            structural_roofs = []
+            if nearest_res is not None and dist_res_pct is not None and 0.5 <= dist_res_pct <= (default_sl_pct + 0.5):
+                structural_roofs.append(dist_res_pct)
+            if poc_price > current_price:
+                poc_dist_pct = ((poc_price - current_price) / current_price) * 100.0
+                if 0.5 <= poc_dist_pct <= (default_sl_pct + 0.5):
+                    structural_roofs.append(poc_dist_pct)
+            if structural_roofs:
+                roof_dist = min(structural_roofs)
+                calc_sl = round(roof_dist + 0.20, 2)
+                suggested_sl = min(default_sl_pct, max(1.0, calc_sl))
 
     return MarketStructureResult(
         symbol=symbol,
+        side=side,
         current_price=round(current_price, 6),
         nearest_resistance=nearest_res,
         dist_to_resistance_pct=dist_res_pct,
@@ -322,10 +363,11 @@ def analyze_market_structure(
         trend_direction=trend_dir,
         trend_slope_hourly_pct=trend_slope,
         is_breakout=is_breakout,
-        broken_resistance=broken_res,
+        is_breakdown=is_breakdown,
+        broken_level=broken_level,
         has_room_to_run=has_room,
         rejection_reason=rejection_reason,
         suggested_tp_pct=suggested_tp,
         suggested_sl_pct=suggested_sl,
-        all_levels=levels[:8]  # En güçlü ilk 8 seviye
+        all_levels=levels[:8]
     )

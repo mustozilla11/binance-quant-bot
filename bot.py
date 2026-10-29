@@ -68,6 +68,7 @@ class Position:
     tp_trigger_pct: float
     tp_delta_pct: float
     timeout_minutes: int
+    side: str = "LONG"
     amount_usdt: float = 100.0
     qty: float = 0.0
     trailing_active: bool = False
@@ -196,8 +197,10 @@ class PaperTradingBot:
             keys_to_compare = [
                 "volume_multiplier", "stop_loss_pct", "trailing_trigger_pct",
                 "trailing_delta_pct", "max_concurrent_positions", "trade_amount_usdt",
-                "break_even_trigger_pct", "commission_pct", "oi_min_increase_pct", "top_trader_ls_max",
-                "use_sr_filter", "min_room_to_resistance_pct", "dynamic_tp_enabled", "structural_sl_enabled"
+                "break_even_trigger_pct", "commission_pct", "oi_min_increase_pct",
+                "top_trader_ls_max", "top_trader_ls_min", "allow_long", "allow_short",
+                "use_sr_filter", "min_room_to_resistance_pct", "min_room_to_support_pct",
+                "dynamic_tp_enabled", "structural_sl_enabled"
             ]
             changes = []
             for k in keys_to_compare:
@@ -319,7 +322,12 @@ class PaperTradingBot:
 
         for sym, pos in self.active_positions.items():
             curr_p = all_prices.get(sym) or pos.entry_price
-            pnl = ((curr_p - pos.entry_price) / pos.entry_price) * 100.0
+            is_short = (pos.side == "SHORT")
+            if is_short:
+                pnl = ((pos.entry_price - curr_p) / pos.entry_price) * 100.0
+            else:
+                pnl = ((curr_p - pos.entry_price) / pos.entry_price) * 100.0
+
             pnl_usd = pos.amount_usdt * (pnl / 100.0)
             duration = (now - pos.entry_time) / 60.0
             emoji = "🟢" if pnl >= 0 else "🔴"
@@ -327,13 +335,14 @@ class PaperTradingBot:
             tr_str = " (🎯 Trailing Aktif)" if pos.trailing_active else ""
 
             sr_part = ""
-            if pos.nearest_resistance or pos.poc_price:
+            if pos.nearest_resistance or pos.nearest_support or pos.poc_price:
                 res_txt = f"${pos.nearest_resistance:.4f}" if pos.nearest_resistance else "Açık"
+                sup_txt = f"${pos.nearest_support:.4f}" if pos.nearest_support else "Açık"
                 poc_txt = f"${pos.poc_price:.4f}" if pos.poc_price else "Yok"
-                sr_part = f"\n   ↳ Direnç: `{res_txt}` | POC: `{poc_txt}` | Trend: `{pos.trend_direction}`"
+                sr_part = f"\n   ↳ Destek: `{sup_txt}` | Direnç: `{res_txt}` | POC: `{poc_txt}`"
 
             lines.append(
-                f"{emoji} *{sym}*: `${curr_p:.4f}` | PnL: *%{pnl:+.2f}* (*${pnl_usd:+.2f}*)\n"
+                f"{emoji} *{sym}* `[{pos.side}]`: `${curr_p:.4f}` | PnL: *%{pnl:+.2f}* (*${pnl_usd:+.2f}*)\n"
                 f"   ↳ Giriş: `${pos.entry_price:.4f}` | Süre: `{duration:.1f} dk`{be_str}{tr_str}{sr_part}"
             )
         lines.append("━━━━━━━━━━━━━━━━━━━━━")
@@ -405,26 +414,40 @@ class PaperTradingBot:
                 continue
 
             entry_price = pos.entry_price
-            raw_pnl_pct = ((curr_price - entry_price) / entry_price) * 100.0
+            is_short = (pos.side == "SHORT")
+
+            if is_short:
+                raw_pnl_pct = ((entry_price - curr_price) / entry_price) * 100.0
+            else:
+                raw_pnl_pct = ((curr_price - entry_price) / entry_price) * 100.0
+
             duration_minutes = (now - pos.entry_time) / 60.0
 
             # 1. Zirve fiyat ve kâr takibi
-            if curr_price > pos.peak_price:
-                pos.peak_price = curr_price
-                pos.peak_pnl_pct = raw_pnl_pct
+            if pos.peak_price == 0.0:
+                pos.peak_price = entry_price
+
+            if is_short:
+                if curr_price < pos.peak_price or pos.peak_pnl_pct == 0.0:
+                    pos.peak_price = curr_price
+                    pos.peak_pnl_pct = raw_pnl_pct
+            else:
+                if curr_price > pos.peak_price or pos.peak_pnl_pct == 0.0:
+                    pos.peak_price = curr_price
+                    pos.peak_pnl_pct = raw_pnl_pct
 
             # 2. Başabaş (Break-Even) Koruma Kontrolü
             if not pos.break_even_active and pos.peak_pnl_pct >= be_trigger:
                 pos.break_even_active = True
-                pos.sl_pct = -be_lock  # Stop-loss'u girişin üzerine (+%0.20 net kâra) taşı
-                logger.info("🛡️ [%s] Break-Even Aktifleşti! Zirve: %%%.2f | Yeni Stop Seviyesi: +%%%.2f",
-                            symbol, pos.peak_pnl_pct, be_lock)
-                self.notifier.notify_break_even(symbol, entry_price, pos.peak_pnl_pct)
+                pos.sl_pct = -be_lock  # Stop-loss'u kârlı bölgeye (+%0.20 net kâra) taşı
+                logger.info("🛡️ [%s (%s)] Break-Even Aktifleşti! Zirve: %%%.2f | Yeni Stop Seviyesi: +%%%.2f",
+                            symbol, pos.side, pos.peak_pnl_pct, be_lock)
+                self.notifier.notify_break_even(symbol, entry_price, pos.peak_pnl_pct, side=pos.side)
 
             # 3. Trailing TP Tetikleme Kontrolü
             if not pos.trailing_active and pos.peak_pnl_pct >= pos.tp_trigger_pct:
                 pos.trailing_active = True
-                logger.info("🎯 [%s] Trailing TP Aktifleşti! Zirve Kâr: %%%.2f", symbol, pos.peak_pnl_pct)
+                logger.info("🎯 [%s (%s)] Trailing TP Aktifleşti! Zirve Kâr: %%%.2f", symbol, pos.side, pos.peak_pnl_pct)
 
             # 4. Çıkış Koşulları Değerlendirmesi
             exit_reason = None
@@ -433,14 +456,23 @@ class PaperTradingBot:
             # Koşul A: Stop-Loss (veya Break-Even Stop)
             if raw_pnl_pct <= -pos.sl_pct:
                 exit_reason = "BREAK_EVEN" if pos.break_even_active else "STOP_LOSS"
-                exit_price = entry_price * (1.0 - pos.sl_pct / 100.0)
+                if is_short:
+                    exit_price = entry_price * (1.0 + pos.sl_pct / 100.0)
+                else:
+                    exit_price = entry_price * (1.0 - pos.sl_pct / 100.0)
 
             # Koşul B: Trailing Stop Gerçekleşmesi
             elif pos.trailing_active:
-                trailing_stop_price = pos.peak_price * (1.0 - pos.tp_delta_pct / 100.0)
-                if curr_price <= trailing_stop_price:
-                    exit_reason = "TRAILING_TP"
-                    exit_price = trailing_stop_price
+                if is_short:
+                    trailing_stop_price = pos.peak_price * (1.0 + pos.tp_delta_pct / 100.0)
+                    if curr_price >= trailing_stop_price:
+                        exit_reason = "TRAILING_TP"
+                        exit_price = trailing_stop_price
+                else:
+                    trailing_stop_price = pos.peak_price * (1.0 - pos.tp_delta_pct / 100.0)
+                    if curr_price <= trailing_stop_price:
+                        exit_reason = "TRAILING_TP"
+                        exit_price = trailing_stop_price
 
             # Koşul C: 40 Dakikalık Zaman Aşımı ("Hacim Söndü")
             elif duration_minutes >= pos.timeout_minutes:
@@ -449,7 +481,11 @@ class PaperTradingBot:
 
             # Kapanış gerekiyorsa uygula
             if exit_reason:
-                gross_pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0
+                if is_short:
+                    gross_pnl_pct = ((entry_price - exit_price) / entry_price) * 100.0
+                else:
+                    gross_pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0
+
                 net_pnl_pct = gross_pnl_pct - commission_pct
                 net_pnl_usd = pos.amount_usdt * (net_pnl_pct / 100.0)
                 comm_usd = pos.amount_usdt * (commission_pct / 100.0)
@@ -457,7 +493,7 @@ class PaperTradingBot:
                 trade_record = {
                     "timestamp": datetime.now().isoformat(),
                     "symbol": symbol,
-                    "side": "LONG",
+                    "side": pos.side,
                     "entry_price": round(entry_price, 6),
                     "exit_price": round(exit_price, 6),
                     "qty": round(pos.qty, 6),
@@ -470,10 +506,12 @@ class PaperTradingBot:
                     "peak_pnl_pct": round(pos.peak_pnl_pct, 2)
                 }
 
-                logger.info("🔴 [%s Pozisyon Kapatıldı] Neden: %s | Net PnL: %%%.2f ($%.2f USDT) | Süre: %.1f dk",
-                            symbol, exit_reason, net_pnl_pct, net_pnl_usd, duration_minutes)
+                logger.info("🔴 [%s (%s) Pozisyon Kapatıldı] Neden: %s | Net PnL: %%%.2f ($%.2f USDT) | Süre: %.1f dk",
+                            symbol, pos.side, exit_reason, net_pnl_pct, net_pnl_usd, duration_minutes)
 
                 self._log_trade_to_csv(trade_record)
+                self.notifier.notify_trade_closed(trade_record)
+                symbols_to_close.append(symbol)
                 self.notifier.notify_trade_closed(trade_record)
                 symbols_to_close.append(symbol)
 
@@ -513,6 +551,9 @@ class PaperTradingBot:
         vol_mult_threshold = float(self.config.get("volume_multiplier", 2.8))
         min_oi_increase = float(self.config.get("oi_min_increase_pct", 2.0))
         max_ls_ratio = float(self.config.get("top_trader_ls_max", 2.2))
+        min_ls_ratio = float(self.config.get("top_trader_ls_min", 0.65))
+        allow_long = bool(self.config.get("allow_long", True))
+        allow_short = bool(self.config.get("allow_short", True))
         min_taker_ratio = float(self.config.get("min_taker_buy_ratio", 0.55))
         min_close_str = float(self.config.get("min_close_strength", 0.60))
 
@@ -544,61 +585,91 @@ class PaperTradingBot:
             prev_candle = df.iloc[-2]
 
             # Kapanmış mum teyidi veya güçlü anlık mum
-            candle = last_candle if (last_candle["close"] > last_candle["open"]) else prev_candle
+            candle = last_candle if (last_candle["close"] != last_candle["open"]) else prev_candle
             vol_sma = candle["vol_sma"]
             if pd.isna(vol_sma) or vol_sma <= 0:
                 continue
 
             actual_vol_mult = candle["volume"] / vol_sma
+            if actual_vol_mult < vol_mult_threshold:
+                continue
+
             is_bullish = candle["close"] > candle["open"]
+            is_bearish = candle["close"] < candle["open"]
 
-            if not (is_bullish and actual_vol_mult >= vol_mult_threshold):
+            target_side = None
+            if allow_long and is_bullish:
+                target_side = "LONG"
+            elif allow_short and is_bearish:
+                target_side = "SHORT"
+            else:
                 continue
 
-            # 2. Filtre: Taker Buy Volume (Alıcı Baskısı Oranı >= %55)
-            taker_vol = float(candle.get("taker_buy_volume", 0.0))
-            taker_ratio = (taker_vol / candle["volume"]) if candle["volume"] > 0 else 0.0
-            if taker_ratio < min_taker_ratio:
-                logger.debug("[%s] Alıcı baskısı yetersiz: %%%.1f < %%%.1f", symbol, taker_ratio * 100, min_taker_ratio * 100)
-                continue
+            # 2. Filtre: Taker Hacim Baskısı (Alıcı veya Satıcı Baskısı Oranı >= %55)
+            taker_buy_vol = float(candle.get("taker_buy_volume", 0.0))
+            if target_side == "LONG":
+                taker_ratio = (taker_buy_vol / candle["volume"]) if candle["volume"] > 0 else 0.0
+                if taker_ratio < min_taker_ratio:
+                    logger.debug("[%s] LONG için alıcı baskısı yetersiz: %%%.1f < %%%.1f", symbol, taker_ratio * 100, min_taker_ratio * 100)
+                    continue
+            else:
+                # SHORT: Satıcı hacmi = (Toplam Hacim - Taker Buy Hacmi)
+                taker_sell_vol = max(0.0, candle["volume"] - taker_buy_vol)
+                taker_ratio = (taker_sell_vol / candle["volume"]) if candle["volume"] > 0 else 0.0
+                if taker_ratio < min_taker_ratio:
+                    logger.debug("[%s] SHORT için satıcı baskısı yetersiz: %%%.1f < %%%.1f", symbol, taker_ratio * 100, min_taker_ratio * 100)
+                    continue
 
-            # 3. Filtre: Üst Fitil / Fakeout Reddi (Kapanış Gücü >= %60)
+            # 3. Filtre: Mum Kapanış Gücü (LONG için üst fitil reddi, SHORT için alt fitil reddi)
             candle_range = candle["high"] - candle["low"]
-            close_strength = ((candle["close"] - candle["low"]) / candle_range) if candle_range > 0 else 1.0
+            if target_side == "LONG":
+                close_strength = ((candle["close"] - candle["low"]) / candle_range) if candle_range > 0 else 1.0
+            else:
+                close_strength = ((candle["high"] - candle["close"]) / candle_range) if candle_range > 0 else 1.0
+
             if close_strength < min_close_str:
-                logger.debug("[%s] Üstten satış iğnesi yemiş: güç %%%.1f < %%%.1f", symbol, close_strength * 100, min_close_str * 100)
+                logger.debug("[%s %s] Mum kapanış gücü yetersiz: %%%.1f < %%%.1f", symbol, target_side, close_strength * 100, min_close_str * 100)
                 continue
 
-            logger.info("🚨 [HACİM ANOMALİSİ + ALICI BASKISI TESPİT EDİLDİ] %s: Hacim %.2fx SMA(20) | Alıcı: %%%.1f | Kapanış Gücü: %%%.1f",
-                        symbol, actual_vol_mult, taker_ratio * 100, close_strength * 100)
+            baskisi_str = "ALICI" if target_side == "LONG" else "SATICI"
+            logger.info("🚨 [HACİM ANOMALİSİ + %s BASKISI TESPİT EDİLDİ] %s (%s): Hacim %.2fx SMA(20) | Baskı: %%%.1f | Kapanış Gücü: %%%.1f",
+                        baskisi_str, symbol, target_side, actual_vol_mult, taker_ratio * 100, close_strength * 100)
 
             # 4. Filtre: 15m Açık Pozisyon (OI) Artışı >= %2.0
+            # Fiyat düşerken veya yükselirken OI artışı kurumsal taze pozisyon açılışını teyit eder
             oi_change = self.client.get_open_interest_change(symbol)
             if oi_change is None:
                 logger.debug("[%s] OI verisi alınamadı, atlanıyor.", symbol)
                 continue
 
             if oi_change < min_oi_increase:
-                logger.info("  ↳ [%s] OI Artışı yetersiz: +%%%.2f (Gereken: >= +%%%.2f). Reddedildi.",
-                            symbol, oi_change, min_oi_increase)
+                logger.info("  ↳ [%s %s] OI Artışı yetersiz: +%%%.2f (Gereken: >= +%%%.2f). Reddedildi.",
+                            symbol, target_side, oi_change, min_oi_increase)
                 continue
 
-            logger.info("  ↳ [%s] OI Teyidi BAŞARILI: +%%%.2f (Taze para girişi doğrulandı) 🟢",
-                        symbol, oi_change)
+            logger.info("  ↳ [%s %s] OI Teyidi BAŞARILI: +%%%.2f (Taze kurumsal para girişi doğrulandı) 🟢",
+                        symbol, target_side, oi_change)
 
-            # 5. Filtre: Top Trader Long/Short Oranı <= 2.2
+            # 5. Filtre: Top Trader Long/Short Oranı Sınırı
             ls_ratio = self.client.get_top_trader_long_short_ratio(symbol)
             if ls_ratio is None:
                 logger.debug("[%s] L/S oranı verisi alınamadı, atlanıyor.", symbol)
                 continue
 
-            if ls_ratio > max_ls_ratio:
-                logger.info("  ↳ [%s] Top Trader L/S Oranı çok yüksek: %.2f (Maks Eşik: %.2f - Kalabalık Long Riski). Reddedildi.",
+            if target_side == "LONG":
+                if ls_ratio > max_ls_ratio:
+                    logger.info("  ↳ [%s LONG] Top Trader L/S Oranı çok yüksek: %.2f (Maks Eşik: %.2f - Kalabalık Long Riski). Reddedildi.",
+                                symbol, ls_ratio, max_ls_ratio)
+                    continue
+                logger.info("  ↳ [%s LONG] L/S Teyidi BAŞARILI: %.2f <= %.2f (Aşırı kalabalık değil) 🟢",
                             symbol, ls_ratio, max_ls_ratio)
-                continue
-
-            logger.info("  ↳ [%s] L/S Teyidi BAŞARILI: %.2f <= %.2f (Aşırı kalabalık değil) 🟢",
-                        symbol, ls_ratio, max_ls_ratio)
+            else:
+                if ls_ratio < min_ls_ratio:
+                    logger.info("  ↳ [%s SHORT] Top Trader L/S Oranı çok düşük: %.2f (Min Eşik: %.2f - Kalabalık Short / Squeeze Riski). Reddedildi.",
+                                symbol, ls_ratio, min_ls_ratio)
+                    continue
+                logger.info("  ↳ [%s SHORT] L/S Teyidi BAŞARILI: %.2f >= %.2f (Aşırı kalabalık değil) 🟢",
+                            symbol, ls_ratio, min_ls_ratio)
 
             # 6. Filtre: Piyasa Yapısı (Destek / Direnç / POC / Room-to-Run)
             struct_info = None
@@ -610,7 +681,8 @@ class PaperTradingBot:
             if use_sr:
                 sr_window = int(self.config.get("sr_pivot_window", 5))
                 sr_tol = float(self.config.get("sr_cluster_tolerance_pct", 0.4))
-                min_room = float(self.config.get("min_room_to_resistance_pct", 1.2))
+                min_room_res = float(self.config.get("min_room_to_resistance_pct", 1.2))
+                min_room_sup = float(self.config.get("min_room_to_support_pct", 1.2))
                 dyn_tp = bool(self.config.get("dynamic_tp_enabled", True))
                 struct_sl = bool(self.config.get("structural_sl_enabled", True))
                 prev_c = float(df["close"].iloc[-2]) if len(df) >= 2 else None
@@ -620,9 +692,11 @@ class PaperTradingBot:
                     df=df,
                     current_price=entry_price,
                     prev_close=prev_c,
+                    side=target_side,
                     window=sr_window,
                     tolerance_pct=sr_tol,
-                    min_room_to_resistance_pct=min_room,
+                    min_room_to_resistance_pct=min_room_res,
+                    min_room_to_support_pct=min_room_sup,
                     default_tp_pct=default_tp,
                     default_sl_pct=default_sl,
                     dynamic_tp_enabled=dyn_tp,
@@ -631,16 +705,25 @@ class PaperTradingBot:
                 struct_info = struct_res.to_dict()
 
                 if not struct_res.has_room_to_run:
-                    logger.info("  ↳ [%s] %s. İşlem İptal Edildi 🛑", symbol, struct_res.rejection_reason)
+                    logger.info("  ↳ [%s %s] %s. İşlem İptal Edildi 🛑", symbol, target_side, struct_res.rejection_reason)
                     continue
 
-                if struct_res.is_breakout:
-                    logger.info("  ↳ [%s] ⚡ DİRENÇ KIRILIMI ONAYLANDI (Kırılan Direnç: $%.4f) 🟢",
-                                symbol, struct_res.broken_resistance or 0.0)
+                if target_side == "LONG":
+                    if struct_res.is_breakout:
+                        logger.info("  ↳ [%s LONG] ⚡ DİRENÇ KIRILIMI ONAYLANDI (Kırılan Direnç: $%.4f) 🟢",
+                                    symbol, struct_res.broken_level or 0.0)
+                    else:
+                        res_str = f"+%{struct_res.dist_to_resistance_pct:.2f}" if struct_res.dist_to_resistance_pct else "Açık Yol"
+                        logger.info("  ↳ [%s LONG] Yapısal Boşluk Teyidi BAŞARILI: Direnç Mesafesi %s (POC: $%.4f | Trend: %s) 🟢",
+                                    symbol, res_str, struct_res.poc_price, struct_res.trend_direction)
                 else:
-                    res_str = f"+%{struct_res.dist_to_resistance_pct:.2f}" if struct_res.dist_to_resistance_pct else "Açık Yol"
-                    logger.info("  ↳ [%s] Yapısal Boşluk Teyidi BAŞARILI: Direnç Mesafesi %s (POC: $%.4f | Trend: %s) 🟢",
-                                symbol, res_str, struct_res.poc_price, struct_res.trend_direction)
+                    if struct_res.is_breakdown:
+                        logger.info("  ↳ [%s SHORT] ⚡ DESTEK KIRILIMI (BREAKDOWN) ONAYLANDI (Kırılan Destek: $%.4f) 🟢",
+                                    symbol, struct_res.broken_level or 0.0)
+                    else:
+                        sup_str = f"-%{struct_res.dist_to_support_pct:.2f}" if struct_res.dist_to_support_pct else "Açık Taban"
+                        logger.info("  ↳ [%s SHORT] Yapısal Boşluk Teyidi BAŞARILI: Destek Mesafesi %s (POC: $%.4f | Trend: %s) 🟢",
+                                    symbol, sup_str, struct_res.poc_price, struct_res.trend_direction)
 
                 sl_pct = struct_res.suggested_sl_pct
                 tp_pct = struct_res.suggested_tp_pct
@@ -648,14 +731,18 @@ class PaperTradingBot:
                 sl_pct = default_sl
                 tp_pct = default_tp
 
-            # TÜM FİLTRELER SAĞLANDI -> SANAL LONG AÇ
+            # TÜM FİLTRELER SAĞLANDI -> SANAL POZİSYON AÇ (LONG / SHORT)
             delta_pct = float(self.config.get("trailing_delta_pct", 1.0))
             timeout_m = int(self.config.get("position_timeout_minutes", 40))
             trade_amount_usdt = float(self.config.get("trade_amount_usdt", 100.0))
             qty = (trade_amount_usdt / entry_price) if entry_price > 0 else 0.0
 
-            sl_price = entry_price * (1.0 - sl_pct / 100.0)
-            tp_trigger_price = entry_price * (1.0 + tp_pct / 100.0)
+            if target_side == "LONG":
+                sl_price = entry_price * (1.0 - sl_pct / 100.0)
+                tp_trigger_price = entry_price * (1.0 + tp_pct / 100.0)
+            else:
+                sl_price = entry_price * (1.0 + sl_pct / 100.0)
+                tp_trigger_price = entry_price * (1.0 - tp_pct / 100.0)
 
             new_pos = Position(
                 symbol=symbol,
@@ -668,6 +755,7 @@ class PaperTradingBot:
                 tp_trigger_pct=tp_pct,
                 tp_delta_pct=delta_pct,
                 timeout_minutes=timeout_m,
+                side=target_side,
                 amount_usdt=trade_amount_usdt,
                 qty=qty,
                 trailing_active=False,
@@ -684,8 +772,9 @@ class PaperTradingBot:
             self.cooldowns[symbol] = now  # 30 dk soğuma başlat
             self._save_positions_to_disk()  # Diske anlık kaydet
 
-            logger.info("✅ [YENİ SANAL LONG] %s @ $%.4f ($%.2f USDT, Miktar: %.4f) | SL: $%.4f (%%%s) | TP Tetik: $%.4f (%%%s)",
-                        symbol, entry_price, trade_amount_usdt, qty, sl_price, sl_pct, tp_trigger_price, tp_pct)
+            side_emoji = "🟢" if target_side == "LONG" else "🔴"
+            logger.info("✅ %s [YENİ SANAL %s] %s @ $%.4f ($%.2f USDT, Miktar: %.4f) | SL: $%.4f (%%%s) | TP Tetik: $%.4f (%%%s)",
+                        side_emoji, target_side, symbol, entry_price, trade_amount_usdt, qty, sl_price, sl_pct, tp_trigger_price, tp_pct)
 
             # Telegram Sinyal Kartı İlet
             self.notifier.notify_signal_card(
@@ -697,7 +786,8 @@ class PaperTradingBot:
                 sl_price=sl_price,
                 tp_trigger_price=tp_trigger_price,
                 config=self.config,
-                structure_info=struct_info
+                structure_info=struct_info,
+                side=target_side
             )
 
             # Eşzamanlı pozisyon limiti varsa ve ulaşıldıysa bu turu bitir

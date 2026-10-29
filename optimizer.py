@@ -60,10 +60,14 @@ DEFAULT_CONFIG = {
     "top_pairs_count": 25,
     "oi_min_increase_pct": 2.0,
     "top_trader_ls_max": 2.2,
+    "top_trader_ls_min": 0.65,
+    "allow_long": True,
+    "allow_short": True,
     "use_sr_filter": True,
     "sr_pivot_window": 5,
     "sr_cluster_tolerance_pct": 0.4,
     "min_room_to_resistance_pct": 1.2,
+    "min_room_to_support_pct": 1.2,
     "dynamic_tp_enabled": True,
     "structural_sl_enabled": True,
     "blacklist": [
@@ -173,14 +177,30 @@ class StrategyBacktester:
                 i += 1
                 continue
 
-            # Giriş Koşulları: Hacim anomalisi + Yeşil mum + Alıcı baskısı + Üst fitil filtresi
+            # Giriş Koşulları: Hacim anomalisi
             vol_ok = volumes[i] >= (vol_sma * vol_multiplier)
-            bullish_ok = closes[i] > opens[i]
-            taker_ok = (taker_buys[i] / volumes[i] >= min_taker_buy_ratio) if volumes[i] > 0 else False
-            rng = highs[i] - lows[i]
-            strength_ok = ((closes[i] - lows[i]) / rng >= min_close_strength) if rng > 0 else True
+            if not vol_ok:
+                i += 1
+                continue
 
-            if vol_ok and bullish_ok and taker_ok and strength_ok:
+            bullish_ok = closes[i] > opens[i]
+            bearish_ok = closes[i] < opens[i]
+            rng = highs[i] - lows[i]
+
+            target_side = None
+            if bullish_ok:
+                taker_ratio = (taker_buys[i] / volumes[i]) if volumes[i] > 0 else 0
+                strength = ((closes[i] - lows[i]) / rng) if rng > 0 else 1.0
+                if taker_ratio >= min_taker_buy_ratio and strength >= min_close_strength:
+                    target_side = "LONG"
+            elif bearish_ok:
+                taker_sell = max(0.0, volumes[i] - taker_buys[i])
+                taker_ratio = (taker_sell / volumes[i]) if volumes[i] > 0 else 0
+                strength = ((highs[i] - closes[i]) / rng) if rng > 0 else 1.0
+                if taker_ratio >= min_taker_buy_ratio and strength >= min_close_strength:
+                    target_side = "SHORT"
+
+            if target_side is not None:
                 entry_price = closes[i]
                 entry_bar = i
                 trailing_active = False
@@ -189,6 +209,7 @@ class StrategyBacktester:
                 exit_price = entry_price
                 exit_reason = "TIMEOUT"
                 exit_bar = i + 1
+                is_short = (target_side == "SHORT")
 
                 # İşlemi ileriye doğru simüle et
                 for j in range(i + 1, min(i + 1 + timeout_bars, n)):
@@ -196,41 +217,80 @@ class StrategyBacktester:
                     bar_low = lows[j]
                     bar_close = closes[j]
 
-                    # 1. Stop-Loss Kontrolü (Başabaş aktifse giriş + %0.20'ye taşınır)
-                    if break_even_active:
-                        effective_sl = entry_price * (1.0 + break_even_lock / 100.0)
-                        if bar_low <= effective_sl:
-                            exit_price = effective_sl
-                            exit_reason = "BREAK_EVEN"
-                            exit_bar = j
-                            break
+                    if is_short:
+                        curr_profit_pct = ((entry_price - bar_low) / entry_price) * 100.0
+                        if curr_profit_pct > ((entry_price - peak_price) / entry_price * 100.0):
+                            peak_price = bar_low
+
+                        # 1. Stop-Loss Kontrolü
+                        if break_even_active:
+                            effective_sl = entry_price * (1.0 - break_even_lock / 100.0)
+                            if bar_high >= effective_sl:
+                                exit_price = effective_sl
+                                exit_reason = "BREAK_EVEN"
+                                exit_bar = j
+                                break
+                        else:
+                            sl_price = entry_price * (1.0 + stop_loss_pct / 100.0)
+                            if bar_high >= sl_price:
+                                exit_price = sl_price
+                                exit_reason = "STOP_LOSS"
+                                exit_bar = j
+                                break
+
+                        # Başabaş tetikleme
+                        peak_profit_pct = ((entry_price - peak_price) / entry_price) * 100.0
+                        if peak_profit_pct >= break_even_trigger:
+                            break_even_active = True
+
+                        # Trailing TP
+                        if peak_profit_pct >= trailing_trigger_pct:
+                            trailing_active = True
+
+                        if trailing_active:
+                            trailing_stop_price = peak_price * (1.0 + trailing_delta_pct / 100.0)
+                            if bar_high >= trailing_stop_price:
+                                exit_price = trailing_stop_price
+                                exit_reason = "TRAILING_TP"
+                                exit_bar = j
+                                break
                     else:
-                        sl_price = entry_price * (1.0 - stop_loss_pct / 100.0)
-                        if bar_low <= sl_price:
-                            exit_price = sl_price
-                            exit_reason = "STOP_LOSS"
-                            exit_bar = j
-                            break
+                        curr_profit_pct = ((bar_high - entry_price) / entry_price) * 100.0
+                        if curr_profit_pct > ((peak_price - entry_price) / entry_price * 100.0):
+                            peak_price = bar_high
 
-                    # 2. Zirve fiyat ve kâr takibi
-                    peak_price = max(peak_price, bar_high)
-                    curr_max_profit_pct = ((peak_price - entry_price) / entry_price) * 100.0
+                        # 1. Stop-Loss Kontrolü
+                        if break_even_active:
+                            effective_sl = entry_price * (1.0 + break_even_lock / 100.0)
+                            if bar_low <= effective_sl:
+                                exit_price = effective_sl
+                                exit_reason = "BREAK_EVEN"
+                                exit_bar = j
+                                break
+                        else:
+                            sl_price = entry_price * (1.0 - stop_loss_pct / 100.0)
+                            if bar_low <= sl_price:
+                                exit_price = sl_price
+                                exit_reason = "STOP_LOSS"
+                                exit_bar = j
+                                break
 
-                    # Başabaş (Break-Even) tetikleme
-                    if curr_max_profit_pct >= break_even_trigger:
-                        break_even_active = True
+                        # Başabaş tetikleme
+                        peak_profit_pct = ((peak_price - entry_price) / entry_price) * 100.0
+                        if peak_profit_pct >= break_even_trigger:
+                            break_even_active = True
 
-                    # Trailing TP Tetikleme
-                    if curr_max_profit_pct >= trailing_trigger_pct:
-                        trailing_active = True
+                        # Trailing TP
+                        if peak_profit_pct >= trailing_trigger_pct:
+                            trailing_active = True
 
-                    if trailing_active:
-                        trailing_stop_price = peak_price * (1.0 - trailing_delta_pct / 100.0)
-                        if bar_low <= trailing_stop_price:
-                            exit_price = max(trailing_stop_price, entry_price * (1.0 + break_even_lock / 100.0) if break_even_active else 0)
-                            exit_reason = "TRAILING_TP"
-                            exit_bar = j
-                            break
+                        if trailing_active:
+                            trailing_stop_price = peak_price * (1.0 - trailing_delta_pct / 100.0)
+                            if bar_low <= trailing_stop_price:
+                                exit_price = trailing_stop_price
+                                exit_reason = "TRAILING_TP"
+                                exit_bar = j
+                                break
 
                     # Zaman Aşımı son bar kontrolü
                     if j == i + timeout_bars or j == n - 1:
@@ -240,11 +300,16 @@ class StrategyBacktester:
                         break
 
                 # Net PnL (Borsa komisyonu düşülmüş)
-                gross_pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0
+                if is_short:
+                    gross_pnl_pct = ((entry_price - exit_price) / entry_price) * 100.0
+                else:
+                    gross_pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0
+
                 net_pnl_pct = gross_pnl_pct - commission_pct
                 trades.append({
                     "entry_bar": entry_bar,
                     "exit_bar": exit_bar,
+                    "side": target_side,
                     "pnl_pct": net_pnl_pct,
                     "exit_reason": exit_reason
                 })

@@ -1,6 +1,6 @@
 # 🤖 Binance USDT-M Vadeli Piyasa Walk-Forward Self-Optimizing Paper Trading Bot
 
-Binance USDT-M Vadeli İşlemler piyasasında çalışan, Açık Pozisyon (Open Interest - OI), Hacim, Taker Alıcı Baskısı, Mum Kapanış Gücü, **Destek/Direnç Kümeleri (Swing S/R)**, **Hacim Profili (Volume Profile - POC)** ve **Trend Doğrusu** anomalilerini tarayan, Telegram çift yönlü interaktif komut destekli ve **"Kendi Parametrelerini Geriye Dönük Testle Güncelleyen" (Walk-Forward Self-Optimizing)** üst düzey kantitatif ticaret (quant trading) botu.
+Binance USDT-M Vadeli İşlemler piyasasında çalışan, Açık Pozisyon (Open Interest - OI), Hacim, Taker Baskısı, Mum Kapanış Gücü, **Destek/Direnç Kümeleri (Swing S/R)**, **Hacim Profili (Volume Profile - POC)** ve **Trend Doğrusu** anomalilerini tarayan, **ÇİFT YÖNLÜ (LONG & SHORT)**, Telegram çift yönlü interaktif komut destekli ve **"Kendi Parametrelerini Geriye Dönük Testle Güncelleyen" (Walk-Forward Self-Optimizing)** üst düzey kantitatif ticaret (quant trading) botu.
 
 ---
 
@@ -12,10 +12,10 @@ binance_quant_bot/
 ├── config.json              # Aktif işlem parametreleri (mtime tabanlı Hot-Reload destekli)
 ├── config.example.json      # Konfigürasyon şablonu
 ├── binance_client.py        # Public Binance Futures REST API istemcisi (API Key gerektirmez, TradFi filtreli)
-├── market_structure.py      # Fraktal Tepe/Dip S/R kümeleri, Hacim POC ve Trend eğimi analiz motoru
+├── market_structure.py      # Fraktal Tepe/Dip S/R kümeleri, Hacim POC ve Trend eğimi analiz motoru (LONG & SHORT)
 ├── telegram_notifier.py     # Emojili bildirimler ve çift yönlü Telegram bot komut dinleyicisi (/durum, /rapor)
-├── optimizer.py             # 5m kline & komisyon simülasyonlu Walk-Forward Grid Search motoru
-├── bot.py                   # Canlı piyasa tarayıcısı, durum kalıcılığı (persistence) ve pozisyon yöneticisi
+├── optimizer.py             # 5m kline & komisyon simülasyonlu çift yönlü Walk-Forward Grid Search motoru
+├── bot.py                   # Canlı piyasa tarayıcısı, durum kalıcılığı (persistence) ve çift yönlü pozisyon yöneticisi
 ├── active_positions.json    # Açık pozisyonların disk üzerindeki anlık durumu (Kapanıp açılsa da kaybolmaz)
 ├── paper_trades.csv         # Komisyon kesintili gerçekçi net kâr/zarar defteri
 ├── requirements.txt         # Minimal bağımlılıklar (Sadece requests ve pandas - C derleyicisi gerektirmez)
@@ -44,7 +44,7 @@ Sabit parametreli botlar değişen piyasa rejimlerinde verimsizleşir. Bu bot, p
 
 1. **Veri Toplama:** En hacimli ilk 5 kripto vadeli paritesinin (BTC, ETH, SOL, XRP, PEPE) son 1.500 adet 5 dakikalık mum verilerini (Taker Buy hacimleri dahil) indirir.
 2. **Kademeli Filtre & Komisyon Simülasyonu:**
-   - Canlı bot ile 1-e-1 aynı 5 dakikalık filtreleri çalıştırır.
+   - Hem **LONG** hem de **SHORT** pozisyon simülasyonunu içerir.
    - Her işlemden `%0.12` oranında komisyon ve kayma (roundtrip fee + slippage) kesintisi uygular.
    - Break-Even stop simülasyonunu içerir.
 3. **Grid Search Alanı:** Toplam 81 kombinasyon simüle edilir:
@@ -60,48 +60,40 @@ Sabit parametreli botlar değişen piyasa rejimlerinde verimsizleşir. Bu bot, p
 
 ---
 
-## 🎯 4. Canlı Piyasa Tarayıcısı ve 6 Kademeli Sinyal Filtresi (`bot.py` & `market_structure.py`)
+## 🎯 4. Çift Yönlü Canlı Piyasa Tarayıcısı (LONG & SHORT)
 
-Bot her 60 saniyede bir en hacimli 25 pariteyi süzer. Sahte kırılımları (fake-out) ve tuzakları engellemek için **6 kademeli teyit filtresi** uygulanır:
+Bot her 60 saniyede bir en hacimli 25 pariteyi süzer. Sahte kırılımları ve tuzakları engellemek için **6 kademeli simetrik teyit filtresi** uygulanır:
 
-1. **5 Dakikalık Hacim Anomalisi:**
-   $$\text{Hacim}_{5m} > \text{SMA}(20, \text{Hacim}) \times \text{config["volume\_multiplier"]}$$
-   Mumun yeşil (yükseliş) olması şarttır (`Close > Open`).
-2. **Taker Alıcı Baskısı (Taker Buy Ratio):**
-   $$\frac{\text{Taker Buy Hacmi}}{\text{Toplam Hacim}} \ge 0.55 \quad (\%55)$$
-   Hacim patlamasının piyasa yapıcı emirlerle değil, piyasayı agresif süpüren gerçek market alıcılarıyla oluştuğu doğrulanır.
-3. **Mum Kapanış Gücü (Upper Wick Reddi):**
-   $$\text{Kapanış Gücü} = \frac{\text{Close} - \text{Low}}{\text{High} - \text{Low}} \ge 0.60 \quad (\%60)$$
-   Mumun üstünde uzun fitil (satıcı baskısı) kalmamış olması, kapanışın mum tepe noktasına yakın gerçekleşmesi şarttır.
-4. **Açık Pozisyon (OI) Teyidi:**
-   Son 15 dakikada Open Interest artışı $\ge \%2.0$ olmalıdır. Hacim artarken OI artıyorsa piyasaya "taze kurumsal para" girdiği teyit edilir.
-5. **Duyarlılık (Top Trader L/S) Filtresi:**
-   Top Trader Long/Short oranı $\le 2.2$ olmalıdır. Oran 2.2 üzerindeyse piyasa aşırı kalabalık long pozisyondadır (Long Squeeze riski) ve sinyal reddedilir.
-6. **🧱 Piyasa Yapısı, Hacim POC ve 'Duvara Çarpma' Engeli (`market_structure.py`):**
-   - **Swing S/R Kümeleri:** Son 24 saatin (288 mum) lokal fraktal tepe/dipleri kümelenerek destek ve direnç bantları çıkarılır.
-   - **Hacim POC (Point of Control):** En çok işlem gören fiyat seviyesi çekim/destek merkezi olarak belirlenir.
-   - **Duvara Çarpma Engeli (Room to Run):** Üstteki güçlü direnç giriş fiyatına `%1.20`'den daha yakınsa (`min_room_to_resistance_pct`) işlem **iptal edilir** (tavana yakın alım engellenir). Eğer mum direnci yukarı kırmışsa **Kırılım (Breakout)** etiketiyle işleme izin verilir.
-7. **Otomatik TradFi & Emtia Engeli:**
-   Binance'in `exchangeInfo` meta verilerindeki `TRADIFI_PERPETUAL` sözleşmeleri ve petrol/altın/endeks varlıkları (`BZUSDT`, `XAUUSDT`, `XAGUSDT`, `SOXLUSDT` vb.) düşük kripto volatilitesi sebebiyle baştan taranmaz.
-8. **Cooldown (Soğuma):**
-   Bir coinde sinyal üretildikten sonra 30 dakika boyunca o pariteden yeni işlem açılmaz.
+| Filtre Kademesi | 🟢 LONG Koşulu | 🔴 SHORT Koşulu |
+|---|---|---|
+| **1. Hacim Anomalisi** | Hacim $> \text{SMA}(20) \times \text{mult}$ ve **Yeşil Mum** (`Close > Open`) | Hacim $> \text{SMA}(20) \times \text{mult}$ ve **Kırmızı Mum** (`Close < Open`) |
+| **2. Taker Baskısı** | Taker Alış Oranı $\ge \%55$ (Agresif alıcı baskısı) | Taker Satış Oranı $\ge \%55$ (Agresif satıcı baskısı) |
+| **3. Mum Kapanış Gücü** | $(Close - Low) / Range \ge 0.60$ (Üst fitil reddi) | $(High - Close) / Range \ge 0.60$ (Alt fitil reddi / sert düşüş) |
+| **4. Açık Pozisyon (OI)** | 15m OI Artışı $\ge +\%2.0$ (Taze para ile Long açılışı) | 15m OI Artışı $\ge +\%2.0$ (Taze para ile Short açılışı) |
+| **5. Top Trader L/S** | Top Trader L/S $\le 2.2$ (Kalabalık Long squeeze engeli) | Top Trader L/S $\ge 0.65$ (Kalabalık Short squeeze engeli) |
+| **6. Piyasa Yapısı** | Üstteki dirence $\ge \%1.2$ boşluk veya **Direnç Kırılımı (Breakout)** | Alttaki desteğe $\ge \%1.2$ boşluk veya **Destek Kırılımı (Breakdown)** |
+
+- **Otomatik TradFi & Emtia Engeli:** Binance'in `exchangeInfo` meta verilerindeki `TRADIFI_PERPETUAL` sözleşmeleri ve petrol/altın/endeks varlıkları (`BZUSDT`, `XAUUSDT`, `XAGUSDT`, `SOXLUSDT` vb.) düşük kripto volatilitesi sebebiyle baştan taranmaz.
+- **Cooldown (Soğuma):** Bir coinde sinyal üretildikten sonra 30 dakika boyunca o pariteden yeni işlem açılmaz.
 
 ---
 
 ## 📈 5. Pozisyon Yönetimi, Dinamik TP, Break-Even ve Borsa Komisyonu
 
-Sinyal geldiğinde anlık piyasa fiyatından sanal LONG açılır (**Sınırsız Eşzamanlı İşlem & Sabit 100 USDT Büyüklük**):
+Sinyal geldiğinde anlık piyasa fiyatından sanal LONG veya SHORT açılır (**Sınırsız Eşzamanlı İşlem & Sabit 100 USDT Büyüklük**):
 
 - **Sabit 100 USDT Kasa Boyutu:** Her işlem sanal olarak tam **100 USDT** tutarında açılır. Kripto miktarı `100 / Giriş Fiyatı` formülüyle otomatik hesaplanır.
 - **Sınırsız İşlem Modu:** `max_concurrent_positions: 0` olarak ayarlandığında, kriterleri sağlayan tüm pariteler bağımsız slotlar halinde eşzamanlı açılır.
 - **🎯 Dinamik Kâr Alma (Take-Profit):**
-  - Üstte girişin `+%1.5` ile varsayılan TP (`+%3.0`) arasında güçlü bir direnç kümesi varsa, TP tetikleyicisi otomatik olarak `direnç - %0.15` seviyesine çekilir (fiyat direnç duvarından dönmeden kâr kilitlenir).
+  - **LONG:** Girişin `+%1.5` ile `+%3.0` yukarısında güçlü bir direnç varsa kâr hedefi `direnç - %0.15` seviyesine çekilir.
+  - **SHORT:** Girişin `-%1.5` ile `-%3.0` aşağısında güçlü bir destek varsa kâr hedefi `destek + %0.15` seviyesine çekilir.
 - **🛡️ Break-Even Koruma (Başa Baş Stop):**
-  - Fiyat kârda **+%1.50** (`break_even_trigger_pct`) seviyesine ulaştığında stop seviyesi otomatik olarak girişin **+%0.20** üzerine (`break_even_lock_pct`) çekilir.
+  - Fiyat kârda **+%1.50** (`break_even_trigger_pct`) seviyesine ulaştığında stop seviyesi otomatik olarak kârlı bölgeye (+%0.20 net kâr) taşınır.
   - Böylece işlem riskten arındırılır; borsa komisyonu garanti altına alınır ve pozisyonun zararla kapanma ihtimali sıfırlanır. Telegram'a özel bildirim atılır.
 - **Trailing Take-Profit:**
   - Fiyat `%config["trailing_trigger_pct"]` kâra ulaştığında Trailing Stop devreye girer.
-  - Ulaşılan tepe fiyattan geriye doğru `%config["trailing_delta_pct"]` kadar sarktığında kâr realizasyonu yapılır.
+  - LONG için zirveden geriye doğru `%config["trailing_delta_pct"]` sarkarsa kâr realizasyonu yapılır.
+  - SHORT için dip fiyattan yukarıya doğru `%config["trailing_delta_pct"]` sekerse kâr realizasyonu yapılır.
 - **Zaman Aşımı (Timeout):**
   - Pozisyon 40 dakika içinde TP veya SL olmadıysa momentumun kaybolduğu kabul edilir ("Hacim Söndü") ve anlık fiyattan kapatılır.
 - **💸 Gerçekçi Borsa Komisyonu (%0.12 Roundtrip):**
@@ -119,7 +111,7 @@ Telegram botunuz sadece bildirim göndermekle kalmaz, Telegram üzerinden yazdı
 
 | Komut | Açıklama | Örnek Çıktı |
 |---|---|---|
-| `/durum` | Açıkta olan tüm sanal pozisyonları, giriş fiyatlarını, anlık kâr/zarar durumlarını, S/R ve POC seviyelerini listeler. | `📊 Aktif Pozisyonlar: SOLUSDT: % +1.82 (BE Aktif) - Direnç: $102.99 ...` |
+| `/durum` | Açıkta olan tüm sanal pozisyonları, yönlerini (`[LONG]` / `[SHORT]`), giriş fiyatlarını, anlık kâr/zarar durumlarını, S/R ve POC seviyelerini listeler. | `📊 Aktif Pozisyonlar: SOLUSDT [SHORT]: % +1.82 (BE Aktif) - Destek: $99.40 ...` |
 | `/rapor` | `paper_trades.csv` defterini tarayarak toplam işlem sayısı, Win Rate (Kazanma Oranı), Toplam Net Dolar ve Yüzdesel PnL özetini sunar. | `📈 Paper Trading Raporu: Toplam İşlem: 14, Win Rate: %71.4, Net Kasa: +12.45$` |
 | `/yardim` | Kullanılabilir bot komutlarını ve açıklamalarını listeler. | Komut listesi ve kılavuz. |
 
@@ -163,12 +155,16 @@ pip install -r requirements.txt
     "top_pairs_count": 25,
     "oi_min_increase_pct": 2.0,
     "top_trader_ls_max": 2.2,
+    "top_trader_ls_min": 0.65,
+    "allow_long": true,
+    "allow_short": true,
     "min_taker_buy_ratio": 0.55,
     "min_close_strength": 0.60,
     "use_sr_filter": true,
     "sr_pivot_window": 5,
     "sr_cluster_tolerance_pct": 0.4,
     "min_room_to_resistance_pct": 1.2,
+    "min_room_to_support_pct": 1.2,
     "dynamic_tp_enabled": true,
     "structural_sl_enabled": true,
     "break_even_trigger_pct": 1.5,
