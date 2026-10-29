@@ -294,14 +294,18 @@ class PaperTradingBot:
 
                         if text == "/durum":
                             self._handle_cmd_status()
-                        elif text == "/rapor":
+                        elif text in ["/rapor", "/ozet"]:
                             self._handle_cmd_report()
+                        elif text.startswith("/kapat"):
+                            self._handle_cmd_close(text)
                         elif text in ["/yardim", "/help", "/start"]:
                             help_msg = (
                                 "🤖 *Binance Quant Bot Komutları:*\n"
                                 "━━━━━━━━━━━━━━━━━━━━━\n"
                                 "• `/durum` - Açık sanal pozisyonları ve anlık PnL durumunu gösterir\n"
-                                "• `/rapor` - Genel kâr/zarar ve işlem performans özetini döner\n"
+                                "• `/rapor` (veya `/ozet`) - Genel kâr/zarar karnesini döner\n"
+                                "• `/kapat <SEMBOL>` - Açık pozisyonu anında kapatır (örn: `/kapat SOLUSDT`)\n"
+                                "• `/kapat hepsi` - Tüm açık pozisyonları tek tuşla kapatır\n"
                                 "• `/yardim` - Bu menüyü gösterir"
                             )
                             self.notifier.send_message(help_msg)
@@ -412,6 +416,80 @@ class PaperTradingBot:
         except Exception as e:
             logger.error("Rapor oluşturma hatası: %s", e)
             self.notifier.send_message(f"⚠️ Rapor hesaplanırken hata oluştu: {e}")
+
+    def _handle_cmd_close(self, text: str) -> None:
+        """
+        /kapat <SEMBOL> veya /kapat hepsi:
+        Açık sanal pozisyonları Telegram komutuyla anında manuel kapatır.
+        """
+        parts = text.strip().split()
+        if len(parts) < 2:
+            self.notifier.send_message("⚠️ Kullanım: `/kapat <SEMBOL>` (örn: `/kapat SOLUSDT`) veya `/kapat hepsi`")
+            return
+
+        target = parts[1].upper().strip()
+        if not self.active_positions:
+            self.notifier.send_message("ℹ️ Kapatılacak açık sanal pozisyon bulunmuyor.")
+            return
+
+        all_prices = self.client.get_all_prices()
+        commission_pct = float(self.config.get("commission_pct", 0.12))
+        now = time.time()
+
+        targets_to_close = []
+        if target in ["HEPSI", "ALL", "*"]:
+            targets_to_close = list(self.active_positions.keys())
+        else:
+            if not target.endswith("USDT"):
+                target += "USDT"
+            if target in self.active_positions:
+                targets_to_close = [target]
+            else:
+                self.notifier.send_message(f"⚠️ `{target}` sembolünde açık pozisyon bulunamadı.")
+                return
+
+        closed_count = 0
+        for sym in targets_to_close:
+            pos = self.active_positions.pop(sym, None)
+            if not pos:
+                continue
+
+            curr_price = all_prices.get(sym) or self.client.get_latest_price(sym) or pos.entry_price
+            duration_minutes = (now - pos.entry_time) / 60.0
+            is_short = (pos.side == "SHORT")
+
+            if is_short:
+                gross_pnl_pct = ((pos.entry_price - curr_price) / pos.entry_price) * 100.0
+            else:
+                gross_pnl_pct = ((curr_price - pos.entry_price) / pos.entry_price) * 100.0
+
+            net_pnl_pct = gross_pnl_pct - commission_pct
+            net_pnl_usd = pos.amount_usdt * (net_pnl_pct / 100.0)
+            comm_usd = pos.amount_usdt * (commission_pct / 100.0)
+
+            trade_record = {
+                "timestamp": datetime.now().isoformat(),
+                "symbol": sym,
+                "side": pos.side,
+                "entry_price": round(pos.entry_price, 6),
+                "exit_price": round(curr_price, 6),
+                "qty": round(pos.qty, 6),
+                "amount_usdt": round(pos.amount_usdt, 2),
+                "pnl_pct": round(net_pnl_pct, 2),
+                "pnl_usd": round(net_pnl_usd, 2),
+                "commission_usd": round(comm_usd, 2),
+                "duration_minutes": round(duration_minutes, 1),
+                "exit_reason": "MANUEL_TELEGRAM (/kapat)",
+                "peak_pnl_pct": round(pos.peak_pnl_pct, 2)
+            }
+
+            self._log_trade_to_csv(trade_record)
+            self.notifier.notify_trade_closed(trade_record)
+            closed_count += 1
+
+        self._save_positions_to_disk()
+        if closed_count > 0:
+            logger.info("Telegram /kapat komutu ile %d adet pozisyon kapatıldı.", closed_count)
 
     def update_and_check_positions(self) -> None:
         """
@@ -575,6 +653,33 @@ class PaperTradingBot:
         logger.info("Piyasa taranıyor: Top %d parite analiz ediliyor (Açık Pozisyonlar: %d | Limit: %s)...",
                     len(top_pairs), current_open, lim_str)
 
+        # 0. Adım: BTC "Şalter" Filtresi (Market Regime Circuit Breaker)
+        # BTC 15m'de sert düşüyorsa veya 5m EMA(20) altında eziliyorsa altcoinlerde LONG açılmaz
+        btc_breaker_enabled = bool(self.config.get("btc_circuit_breaker_enabled", True))
+        btc_drop_threshold = float(self.config.get("btc_15m_drop_threshold_pct", -0.80))
+
+        if btc_breaker_enabled:
+            btc_df = self.client.get_klines("BTCUSDT", interval="5m", limit=30)
+            if btc_df is not None and len(btc_df) >= 20:
+                btc_closes = btc_df["close"]
+                btc_curr = float(btc_closes.iloc[-1])
+                btc_open_3bars = float(btc_df["open"].iloc[-3])
+                btc_15m_pct = ((btc_curr - btc_open_3bars) / btc_open_3bars) * 100.0 if btc_open_3bars > 0 else 0.0
+                btc_ema20 = float(btc_closes.ewm(span=20, adjust=False).mean().iloc[-1])
+
+                is_risk_off = False
+                risk_reason = ""
+                if btc_15m_pct <= btc_drop_threshold:
+                    is_risk_off = True
+                    risk_reason = f"BTC son 15 dakikada %{btc_15m_pct:+.2f} düştü (Eşik: %{btc_drop_threshold:.2f})"
+                elif btc_curr < (btc_ema20 * 0.997):
+                    is_risk_off = True
+                    risk_reason = f"BTC 5m EMA(20) altında sert satış baskısında (${btc_curr:.1f} < ${btc_ema20:.1f})"
+
+                if is_risk_off:
+                    logger.warning("⚠️ [BTC ŞALTERİ DEVREDE - RISK-OFF] %s. Altcoin piyasa taraması ve LONG girişleri geçici olarak durduruldu.", risk_reason)
+                    return
+
         now = time.time()
         cooldown_sec = float(self.config.get("cooldown_minutes", 30)) * 60.0
         vol_mult_threshold = float(self.config.get("volume_multiplier", 2.8))
@@ -583,7 +688,7 @@ class PaperTradingBot:
         min_ls_ratio = float(self.config.get("top_trader_ls_min", 0.65))
         allow_long = bool(self.config.get("allow_long", True))
         allow_short = bool(self.config.get("allow_short", True))
-        min_taker_ratio = float(self.config.get("min_taker_buy_ratio", 0.55))
+        min_taker_ratio = float(self.config.get("min_taker_buy_ratio", 0.58))
         min_close_str = float(self.config.get("min_close_strength", 0.60))
 
         for symbol in top_pairs:
@@ -732,12 +837,15 @@ class PaperTradingBot:
 
                 use_atr_sl = bool(self.config.get("use_atr_dynamic_sl", True))
                 atr_per = int(self.config.get("atr_period", 14))
-                atr_mult = float(self.config.get("atr_sl_multiplier", 1.8))
+                atr_mult = float(self.config.get("atr_sl_multiplier", 2.0))
+                atr_tp_mult = float(self.config.get("atr_tp_multiplier", 2.5))
                 min_sl = float(self.config.get("min_sl_pct", 1.0))
                 max_sl = float(self.config.get("max_sl_pct", 3.5))
                 max_candle_atr = float(self.config.get("max_candle_atr_ratio", 3.0))
                 max_l_rsi = float(self.config.get("max_long_rsi", 78.0))
                 min_s_rsi = float(self.config.get("min_short_rsi", 22.0))
+                funding_rate = self.client.get_funding_rate(symbol)
+                squeeze_th = float(self.config.get("squeeze_funding_rate_threshold", -0.01))
 
                 struct_res = analyze_market_structure(
                     symbol=symbol,
@@ -758,11 +866,14 @@ class PaperTradingBot:
                     use_atr_dynamic_sl=use_atr_sl,
                     atr_period=atr_per,
                     atr_sl_multiplier=atr_mult,
+                    atr_tp_multiplier=atr_tp_mult,
                     min_sl_pct=min_sl,
                     max_sl_pct=max_sl,
                     max_candle_atr_ratio=max_candle_atr,
                     max_long_rsi=max_l_rsi,
-                    min_short_rsi=min_s_rsi
+                    min_short_rsi=min_s_rsi,
+                    funding_rate=funding_rate,
+                    squeeze_threshold=squeeze_th
                 )
                 struct_info = struct_res.to_dict()
 
@@ -771,6 +882,10 @@ class PaperTradingBot:
                     continue
 
                 if target_side == "LONG":
+                    if struct_res.is_short_squeeze:
+                        logger.info("  ↳ [%s LONG] 🔥 SHORT SQUEEZE POTANSİYELİ: Fonlama Oranı %%%.4f ile sıkışan satıcılar! 🚀",
+                                    symbol, funding_rate or 0.0)
+
                     if struct_res.is_breakout:
                         logger.info("  ↳ [%s LONG] ⚡ DİRENÇ KIRILIMI ONAYLANDI (Kırılan Direnç: $%.4f) 🟢",
                                     symbol, struct_res.broken_level or 0.0)

@@ -195,13 +195,28 @@ class TelegramNotifier:
                 f"• 5m Trend: *{trend_dir}* (`{trend_slope:+.2f}%/saat`)\n\n"
             )
 
-        title = "🔴 *YENİ SANAL SHORT SİNYALİ AÇILDI*" if is_short else "🟢 *YENİ SANAL LONG SİNYALİ AÇILDI*"
+        is_squeeze = structure_info.get("is_short_squeeze", False) if structure_info else False
+        funding_rate = structure_info.get("funding_rate") if structure_info else None
+        squeeze_banner = ""
+        if is_squeeze:
+            fr_str = f"%{funding_rate:+.4f}" if funding_rate is not None else "Negatif"
+            squeeze_banner = f"🔥 *[YÜKSEK GÜVENLİ SİNYAL - SHORT SQUEEZE POTANSİYELİ]*\n• Negatif Fonlama ({fr_str}) ile sıkışan satıcılar patlama aşamasında!\n\n"
+
+        if is_short:
+            title = "🔴 *YENİ SANAL SHORT SİNYALİ AÇILDI*"
+        elif is_squeeze:
+            title = "🚀 *YENİ SANAL LONG SİNYALİ (SHORT SQUEEZE)*"
+        else:
+            title = "🟢 *YENİ SANAL LONG SİNYALİ AÇILDI*"
+
         action_name = "SHORT (Düşüş Yönlü)" if is_short else "LONG (Yükseliş Yönlü)"
         ls_rule = f">={min_ls}" if is_short else f"<={max_ls}"
         sl_sign = "+" if is_short else "-"
         tp_sign = "-" if is_short else "+"
+        funding_line = f"• Fonlama Oranı (Funding): *%{funding_rate:+.4f}*\n" if funding_rate is not None else ""
 
         text = (
+            f"{squeeze_banner}"
             f"{title}\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🪙 Parite: *{symbol}* | Yön: *{action_name}*\n"
@@ -211,11 +226,12 @@ class TelegramNotifier:
             "📊 *Anomali ve Teyit Metrikleri:*\n"
             f"• 5m Hacim Artışı: *{vol_mult:.2f}x SMA(20)* 🚀\n"
             f"• 15m Açık Pozisyon (OI): *+%{oi_change:.2f}* 🟢\n"
-            f"• Top Trader L/S: *{ls_ratio:.2f}* (Kural: {ls_rule})\n\n"
+            f"• Top Trader L/S: *{ls_ratio:.2f}* (Kural: {ls_rule})\n"
+            f"{funding_line}\n"
             f"{struct_section}"
             "🎯 *Pozisyon Çıkış Parametreleri:*\n"
-            f"• Stop-Loss ({sl_sign}%{sl_pct}): `${sl_price:{fmt}}`\n"
-            f"• Trailing TP Tetik ({tp_sign}%{tp_pct}): `${tp_trigger_price:{fmt}}`\n"
+            f"• Stop-Loss ({sl_sign}%{sl_pct}): `${sl_price:{fmt}}` (Dinamik ATR)\n"
+            f"• Trailing TP Tetik ({tp_sign}%{tp_pct}): `${tp_trigger_price:{fmt}}` (Dinamik ATR)\n"
             f"• Trailing Delta: `%{delta_pct}` (Kârdan sarkma)\n"
             f"• Zaman Aşımı: `{timeout_m} Dakika`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -285,7 +301,7 @@ class TelegramNotifier:
             f"• Zaman Aşımı: `{config.get('position_timeout_minutes', 40)} dk`\n"
             f"• Tarama Periyodu: `{config.get('scan_interval_seconds', 60)} sn`\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "💬 *Komutlar:* `/durum` (Açık işlemler), `/rapor` (İşlem karnesi)\n"
+            "💬 *Komutlar:* `/durum` (Açık işlemler), `/rapor` (veya `/ozet`), `/kapat <SEMBOL>` (Manuel çıkış)\n"
             "🚀 Canlı piyasa taraması başlatıldı..."
         )
         return self.send_message(text)

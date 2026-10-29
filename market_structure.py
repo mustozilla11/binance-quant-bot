@@ -56,6 +56,8 @@ class MarketStructureResult:
     htf_bias: str = "NEUTRAL"
     htf_desc: str = ""
     is_overextended: bool = False
+    funding_rate: Optional[float] = None
+    is_short_squeeze: bool = False
 
     @property
     def broken_resistance(self) -> Optional[float]:
@@ -93,7 +95,9 @@ class MarketStructureResult:
             "rsi_value": self.rsi_value,
             "htf_bias": self.htf_bias,
             "htf_desc": self.htf_desc,
-            "is_overextended": self.is_overextended
+            "is_overextended": self.is_overextended,
+            "funding_rate": self.funding_rate,
+            "is_short_squeeze": self.is_short_squeeze
         }
 
 
@@ -374,12 +378,15 @@ def analyze_market_structure(
     use_htf_filter: bool = True,
     use_atr_dynamic_sl: bool = True,
     atr_period: int = 14,
-    atr_sl_multiplier: float = 1.8,
+    atr_sl_multiplier: float = 2.0,
+    atr_tp_multiplier: float = 2.5,
     min_sl_pct: float = 1.0,
     max_sl_pct: float = 3.5,
     max_candle_atr_ratio: float = 3.0,
     max_long_rsi: float = 78.0,
-    min_short_rsi: float = 22.0
+    min_short_rsi: float = 22.0,
+    funding_rate: Optional[float] = None,
+    squeeze_threshold: float = -0.01
 ) -> MarketStructureResult:
     """
     Kapsamlı ve Asimetrik Piyasa Yapısı Analiz Motoru:
@@ -532,18 +539,24 @@ def analyze_market_structure(
                         f"Tabana çarpıp sekme riski yüksek (Destek: ${nearest_sup:.4f})"
                     )
 
-    # 6. Dinamik TP (Take-Profit)
-    suggested_tp = default_tp_pct
+    # 6. Dinamik ATR ve Direnç Uyumlu TP (Take-Profit)
+    if atr_pct > 0 and dynamic_tp_enabled:
+        # Volatiliteye göre nefes alan dinamik kâr hedefi (2.5 x ATR)
+        base_tp = float(np.clip(round(atr_pct * atr_tp_multiplier, 2), 1.8, 6.0))
+    else:
+        base_tp = float(default_tp_pct)
+
+    suggested_tp = base_tp
     if dynamic_tp_enabled:
         if side == "LONG" and nearest_res is not None and dist_res_pct is not None:
-            if 1.5 <= dist_res_pct <= default_tp_pct:
+            if 1.5 <= dist_res_pct <= suggested_tp:
                 suggested_tp = max(1.5, round(dist_res_pct - 0.15, 2))
         elif side == "SHORT" and nearest_sup is not None and dist_sup_pct is not None:
-            if 1.2 <= dist_sup_pct <= default_tp_pct:
+            if 1.2 <= dist_sup_pct <= suggested_tp:
                 suggested_tp = max(1.2, round(dist_sup_pct - 0.15, 2))
 
     # 7. Dinamik Volatilite (ATR) ve Yapısal Stop-Loss
-    # Sabit %1.5 stop yerine coinin volatilitesine (ATR) duyarlı stop
+    # Sabit %1.5 stop yerine coinin volatilitesine (2.0 x ATR) duyarlı stop
     if use_atr_dynamic_sl and atr_pct > 0:
         base_sl = float(np.clip(round(atr_pct * atr_sl_multiplier, 2), min_sl_pct, max_sl_pct))
     else:
@@ -578,6 +591,11 @@ def analyze_market_structure(
                 calc_sl = round(roof_dist + 0.15, 2)
                 suggested_sl = float(np.clip(calc_sl, min_sl_pct, max_sl_pct))
 
+    # Short Squeeze Tespiti (LONG için: Hacim anomalisi + Negatif Fonlama)
+    is_short_squeeze = False
+    if side == "LONG" and funding_rate is not None and funding_rate <= squeeze_threshold:
+        is_short_squeeze = True
+
     return MarketStructureResult(
         symbol=symbol,
         side=side,
@@ -605,5 +623,7 @@ def analyze_market_structure(
         rsi_value=rsi_val,
         htf_bias=htf_res.bias,
         htf_desc=htf_res.desc,
-        is_overextended=is_overextended
+        is_overextended=is_overextended,
+        funding_rate=funding_rate,
+        is_short_squeeze=is_short_squeeze
     )

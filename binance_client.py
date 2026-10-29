@@ -248,6 +248,21 @@ class BinanceFuturesClient:
             logger.debug("L/S oranı hesaplama hatası (%s): %s", symbol, e)
             return None
 
+    def get_funding_rate(self, symbol: str) -> Optional[float]:
+        """
+        Sembolün anlık fonlama oranını (Funding Rate) yüzdesel (%) olarak getirir.
+        /fapi/v1/premiumIndex?symbol=...
+        Örn: 0.0001 -> %0.01 | -0.0002 -> -%0.02 (Negatif Fonlama = Sıkışan Shortlar)
+        """
+        data = self._request("/fapi/v1/premiumIndex", params={"symbol": symbol})
+        if data and isinstance(data, dict) and "lastFundingRate" in data:
+            try:
+                rate = float(data["lastFundingRate"]) * 100.0
+                return round(rate, 4)
+            except (ValueError, TypeError):
+                pass
+        return None
+
     def get_latest_price(self, symbol: str) -> Optional[float]:
         """
         Tek bir sembolün güncel fiyatını getirir.
