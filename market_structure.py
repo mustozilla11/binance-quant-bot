@@ -9,8 +9,8 @@ Hacim Profili (Volume Profile - POC) ve Trend Doğrusu Analiz Modülü.
 - Hacim Profili (Volume Profile) üzerinden Point of Control (POC) hesabı.
 - Lineer regresyon ile trend yönü ve saatlik eğim açısı tespiti.
 - LONG için 'Duvara Çarpma' (Room-to-Resistance) ve Direnç Kırılım (Breakout) doğrulaması.
-- SHORT için 'Tabana Çarpma' (Room-to-Support) ve Destek Kırılım (Breakdown) doğrulaması.
-- Çift yönlü dinamik Kâr Alma (Take-Profit) ve yapısal Zarar Durdurma (Stop-Loss) önerileri.
+- SHORT için asimetrik 'Dirençten Red / Fakeout' (Resistance Rejection) ve 'Tabana Çarpma' kontrolü.
+- Çift yönlü asimetrik Kâr Alma (Take-Profit) ve yapısal Zarar Durdurma (Stop-Loss) önerileri.
 """
 
 from dataclasses import dataclass
@@ -34,6 +34,8 @@ class MarketStructureResult:
     trend_slope_hourly_pct: float
     is_breakout: bool             # Direnç yukarı kırıldı mı? (LONG için)
     is_breakdown: bool            # Destek aşağı kırıldı mı? (SHORT için)
+    is_rejection: bool            # Direnç / POC tepesinden red yedi mi? (SHORT için altın kural)
+    rejection_source: Optional[str]
     broken_level: Optional[float]
     has_room_to_run: bool
     rejection_reason: Optional[str]
@@ -64,6 +66,8 @@ class MarketStructureResult:
             "trend_slope_hourly_pct": self.trend_slope_hourly_pct,
             "is_breakout": self.is_breakout,
             "is_breakdown": self.is_breakdown,
+            "is_rejection": self.is_rejection,
+            "rejection_source": self.rejection_source,
             "broken_level": self.broken_level,
             "has_room_to_run": self.has_room_to_run,
             "rejection_reason": self.rejection_reason,
@@ -92,7 +96,6 @@ def find_sr_clusters(
 
     pivots: List[Tuple[str, float]] = []
 
-    # 1. Lokal Tepe (Swing High) ve Lokal Dip (Swing Low) Tespiti
     for i in range(window, n - window):
         is_high = highs[i] == np.max(highs[i - window : i + window + 1])
         is_low = lows[i] == np.min(lows[i - window : i + window + 1])
@@ -105,7 +108,6 @@ def find_sr_clusters(
     if not pivots:
         return []
 
-    # 2. Tolerans Dahilinde Fiyat Kümelerine Birleştir
     pivots.sort(key=lambda x: x[1])
     clusters: List[List[Tuple[str, float]]] = []
 
@@ -120,7 +122,6 @@ def find_sr_clusters(
         if not matched:
             clusters.append([(p_type, price)])
 
-    # 3. En Az 'min_touches' Kez Test Edilmiş Güçlü Seviyeleri Derle
     levels = []
     for cluster in clusters:
         if len(cluster) >= min_touches:
@@ -202,14 +203,59 @@ def calculate_trend_slope(
     except Exception:
         return "Yatay Bant ↔", 0.0
 
-    if hourly_pct >= 0.30:
+    if hourly_pct >= 0.25:
         direction = "Yükselen Trend ↗"
-    elif hourly_pct <= -0.30:
+    elif hourly_pct <= -0.25:
         direction = "Düşen Trend ↘"
     else:
         direction = "Yatay Bant ↔"
 
     return direction, hourly_pct
+
+
+def detect_resistance_rejection(
+    candle: pd.Series,
+    levels: List[Dict[str, Any]],
+    poc_price: float,
+    tolerance_pct: float = 0.5
+) -> Tuple[bool, Optional[float], str]:
+    """
+    SHORT için altın kurulum:
+    Fiyatın bir direnç kümesini veya POC seviyesini yukarı test edip (Fakeout/Retest)
+    oradan sert satışla dönüp dönmediğini (Rejection) ölçer.
+    """
+    try:
+        high = float(candle["high"])
+        low = float(candle["low"])
+        close = float(candle["close"])
+        op = float(candle["open"])
+    except Exception:
+        return False, None, ""
+
+    rng = high - low
+    if rng <= 0:
+        return False, None, ""
+
+    upper_wick = high - max(op, close)
+    wick_ratio = upper_wick / rng
+
+    # 1. Direnç Kümelerinden Reddi Kontrol Et
+    for lvl in levels:
+        lvl_p = float(lvl["price"])
+        if lvl_p <= low:
+            continue
+        # Fiyat dirence yaklaştı veya deldi, ancak altında kapattı
+        if high >= lvl_p * (1.0 - tolerance_pct / 100.0) and close <= lvl_p:
+            if wick_ratio >= 0.30 or close < op:
+                return True, lvl_p, f"Direnç Reddi (${lvl_p:.4f})"
+
+    # 2. Hacim POC Seviyesinden Reddi Kontrol Et
+    if poc_price > low:
+        if high >= poc_price * (1.0 - tolerance_pct / 100.0) and close <= poc_price:
+            if wick_ratio >= 0.30 or close < op:
+                return True, poc_price, f"POC Hacim Reddi (${poc_price:.4f})"
+
+    return False, None, ""
 
 
 def analyze_market_structure(
@@ -228,12 +274,10 @@ def analyze_market_structure(
     structural_sl_enabled: bool = True
 ) -> MarketStructureResult:
     """
-    Hem LONG hem de SHORT yönlü piyasa yapısı değerlendirmesi:
-    - Destek/Direnç kümeleri
-    - POC seviyesi & Trend eğimi
+    Hem LONG hem de SHORT yönlü asimetrik piyasa yapısı değerlendirmesi:
+    - Destek/Direnç kümeleri & POC seviyesi
     - LONG: Kırılım (Breakout) ve Duvara Çarpma (Room to Resistance) kontrolü
-    - SHORT: Kırılım (Breakdown) ve Tabana Çarpma (Room to Support) kontrolü
-    - Yöne duyarlı Dinamik TP & Yapısal SL hesaplaması
+    - SHORT: 'Dirençten Red (Rejection)' ve 'Tabana Çarpma (Room to Support)' kontrolü
     """
     if current_price <= 0:
         current_price = float(df["close"].iloc[-1]) if (df is not None and len(df) > 0) else 1.0
@@ -263,16 +307,19 @@ def analyze_market_structure(
     if nearest_sup is not None:
         dist_sup_pct = round(((current_price - nearest_sup) / current_price) * 100.0, 2)
 
-    # 3. Kırılım (Breakout / Breakdown) Tespiti
+    # 3. Kırılım ve Red Tespiti
     is_breakout = False
     is_breakdown = False
+    is_rejection = False
+    rejection_source = None
     broken_level = None
+
+    last_candle = df.iloc[-1] if df is not None and len(df) > 0 else None
 
     if prev_close is not None and prev_close > 0:
         for lvl in levels:
             lvl_p = lvl["price"]
             if side == "LONG":
-                # Direnç yukarı kırıldı mı?
                 if prev_close <= lvl_p <= current_price or (
                     current_price > lvl_p and ((current_price - lvl_p) / lvl_p * 100.0) <= 0.6
                 ):
@@ -280,7 +327,6 @@ def analyze_market_structure(
                     broken_level = lvl_p
                     break
             else:
-                # Destek aşağı kırıldı mı?
                 if prev_close >= lvl_p >= current_price or (
                     current_price < lvl_p and ((lvl_p - current_price) / lvl_p * 100.0) <= 0.6
                 ):
@@ -288,7 +334,17 @@ def analyze_market_structure(
                     broken_level = lvl_p
                     break
 
-    # 4. 'Duvara / Tabana Çarpma' (Room-to-Run) Değerlendirmesi
+    if side == "SHORT" and last_candle is not None:
+        is_rejection, rej_p, rej_src = detect_resistance_rejection(
+            candle=last_candle,
+            levels=levels,
+            poc_price=poc_price,
+            tolerance_pct=0.5
+        )
+        if is_rejection:
+            rejection_source = rej_src
+
+    # 4. Asimetrik Kalite ve 'Duvara / Tabana Çarpma' Kontrolü
     has_room = True
     rejection_reason = None
 
@@ -298,16 +354,25 @@ def analyze_market_structure(
                 has_room = False
                 rejection_reason = (
                     f"Direnç Çok Yakın (+%{dist_res_pct:.2f} < +%{min_room_to_resistance_pct:.2f}). "
-                    f"Duvara çarpma riski yüksek (Direnç: ${nearest_res:.4f})"
+                    f"Duvara çarpma riski (Direnç: ${nearest_res:.4f})"
                 )
     else:
-        # SHORT: Altımızda çok yakın destek varsa tabana çarpıp sekme riski
-        if nearest_sup is not None and not is_breakdown:
+        # SHORT İÇİN ASİMETRİK KURALLAR:
+        # Kural A: Güçlü Boğa Trendinde SHORT AÇILMAZ (Trend koruması)
+        if trend_slope >= 0.25:
+            has_room = False
+            rejection_reason = (
+                f"Güçlü Yükselen Trend (+%{trend_slope:.2f}/saat). "
+                f"Boğa trendinde short açmak yüksek risklidir."
+            )
+
+        # Kural B: Tabana Çok Yakınsa SHORT AÇILMAZ (Sekme riski)
+        elif nearest_sup is not None and not is_breakdown:
             if dist_sup_pct is not None and dist_sup_pct < min_room_to_support_pct:
                 has_room = False
                 rejection_reason = (
                     f"Destek Çok Yakın (-%{dist_sup_pct:.2f} < -%{min_room_to_support_pct:.2f}). "
-                    f"Tabana çarpma riski yüksek (Destek: ${nearest_sup:.4f})"
+                    f"Tabana çarpıp sekme riski yüksek (Destek: ${nearest_sup:.4f})"
                 )
 
     # 5. Dinamik TP (Take-Profit)
@@ -317,9 +382,9 @@ def analyze_market_structure(
             if 1.5 <= dist_res_pct <= default_tp_pct:
                 suggested_tp = max(1.5, round(dist_res_pct - 0.15, 2))
         elif side == "SHORT" and nearest_sup is not None and dist_sup_pct is not None:
-            # Düşüşte kârı desteğin hemen üzerinde realize et
-            if 1.5 <= dist_sup_pct <= default_tp_pct:
-                suggested_tp = max(1.5, round(dist_sup_pct - 0.15, 2))
+            # Short'ta desteğin hemen üstünde kâr realize et
+            if 1.2 <= dist_sup_pct <= default_tp_pct:
+                suggested_tp = max(1.2, round(dist_sup_pct - 0.15, 2))
 
     # 6. Yapısal SL (Stop-Loss)
     suggested_sl = default_sl_pct
@@ -337,7 +402,7 @@ def analyze_market_structure(
                 calc_sl = round(floor_dist + 0.20, 2)
                 suggested_sl = min(default_sl_pct, max(1.0, calc_sl))
         else:
-            # SHORT: Tavan (Direnç veya üstteki POC) stop seviyesi olarak kullanılır
+            # SHORT: Tavan (Direnç veya üstteki POC) koruyucu çatı kabul edilir
             structural_roofs = []
             if nearest_res is not None and dist_res_pct is not None and 0.5 <= dist_res_pct <= (default_sl_pct + 0.5):
                 structural_roofs.append(dist_res_pct)
@@ -364,6 +429,8 @@ def analyze_market_structure(
         trend_slope_hourly_pct=trend_slope,
         is_breakout=is_breakout,
         is_breakdown=is_breakdown,
+        is_rejection=is_rejection,
+        rejection_source=rejection_source,
         broken_level=broken_level,
         has_room_to_run=has_room,
         rejection_reason=rejection_reason,

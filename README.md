@@ -64,44 +64,35 @@ Sabit parametreli botlar değişen piyasa rejimlerinde verimsizleşir. Bu bot, p
 
 Bot her 60 saniyede bir en hacimli 25 pariteyi süzer. Sahte kırılımları ve tuzakları engellemek için **6 kademeli simetrik teyit filtresi** uygulanır:
 
-| Filtre Kademesi | 🟢 LONG Koşulu | 🔴 SHORT Koşulu |
+| Filtre Kademesi | 🟢 LONG Koşulu (Trend Kırılımı) | 🔴 SHORT Koşulu (Direnç Reddi & Asimetrik Scalp) |
 |---|---|---|
 | **1. Hacim Anomalisi** | Hacim $> \text{SMA}(20) \times \text{mult}$ ve **Yeşil Mum** (`Close > Open`) | Hacim $> \text{SMA}(20) \times \text{mult}$ ve **Kırmızı Mum** (`Close < Open`) |
 | **2. Taker Baskısı** | Taker Alış Oranı $\ge \%55$ (Agresif alıcı baskısı) | Taker Satış Oranı $\ge \%55$ (Agresif satıcı baskısı) |
-| **3. Mum Kapanış Gücü** | $(Close - Low) / Range \ge 0.60$ (Üst fitil reddi) | $(High - Close) / Range \ge 0.60$ (Alt fitil reddi / sert düşüş) |
+| **3. Mum Formasyonu** | $(Close - Low) / Range \ge 0.60$ (Üst fitil reddi) | **Dirençten / POC'den Red (Rejection)** veya Alt fitilsiz sert satış |
 | **4. Açık Pozisyon (OI)** | 15m OI Artışı $\ge +\%2.0$ (Taze para ile Long açılışı) | 15m OI Artışı $\ge +\%2.0$ (Taze para ile Short açılışı) |
-| **5. Top Trader L/S** | Top Trader L/S $\le 2.2$ (Kalabalık Long squeeze engeli) | Top Trader L/S $\ge 0.65$ (Kalabalık Short squeeze engeli) |
-| **6. Piyasa Yapısı** | Üstteki dirence $\ge \%1.2$ boşluk veya **Direnç Kırılımı (Breakout)** | Alttaki desteğe $\ge \%1.2$ boşluk veya **Destek Kırılımı (Breakdown)** |
-
-- **Otomatik TradFi & Emtia Engeli:** Binance'in `exchangeInfo` meta verilerindeki `TRADIFI_PERPETUAL` sözleşmeleri ve petrol/altın/endeks varlıkları (`BZUSDT`, `XAUUSDT`, `XAGUSDT`, `SOXLUSDT` vb.) düşük kripto volatilitesi sebebiyle baştan taranmaz.
-- **Cooldown (Soğuma):** Bir coinde sinyal üretildikten sonra 30 dakika boyunca o pariteden yeni işlem açılmaz.
+| **5. Squeeze / Kalabalık** | Top Trader L/S $\le 2.2$ (Kalabalık Long squeeze engeli) | Top Trader L/S $\ge 0.80$ (Kalabalık Short / Squeeze engeli) |
+| **6. Trend Koruması** | - | **Güçlü Boğa Trendinde Short Açılmaz** (Trend Slope $\le 0.25$) |
+| **7. Piyasa Yapısı** | Üstteki dirence $\ge \%1.2$ boşluk veya **Direnç Kırılımı (Breakout)** | Alttaki desteğe $\ge \%1.2$ boşluk veya **Dirençten Dönüş (Rejection)** |
 
 ---
 
-## 📈 5. Pozisyon Yönetimi, Dinamik TP, Break-Even ve Borsa Komisyonu
+## 📈 5. Asimetrik Pozisyon Yönetimi, Dinamik TP ve Çıkışlar
 
-Sinyal geldiğinde anlık piyasa fiyatından sanal LONG veya SHORT açılır (**Sınırsız Eşzamanlı İşlem & Sabit 100 USDT Büyüklük**):
+Finansal piyasalarda düşüşler hızlı ve sert V-dönüşlerine (Short Squeeze) açık olduğu için, bot **LONG ve SHORT pozisyonları için farklı parametreler** işletir:
 
-- **Sabit 100 USDT Kasa Boyutu:** Her işlem sanal olarak tam **100 USDT** tutarında açılır. Kripto miktarı `100 / Giriş Fiyatı` formülüyle otomatik hesaplanır.
-- **Sınırsız İşlem Modu:** `max_concurrent_positions: 0` olarak ayarlandığında, kriterleri sağlayan tüm pariteler bağımsız slotlar halinde eşzamanlı açılır.
-- **🎯 Dinamik Kâr Alma (Take-Profit):**
-  - **LONG:** Girişin `+%1.5` ile `+%3.0` yukarısında güçlü bir direnç varsa kâr hedefi `direnç - %0.15` seviyesine çekilir.
-  - **SHORT:** Girişin `-%1.5` ile `-%3.0` aşağısında güçlü bir destek varsa kâr hedefi `destek + %0.15` seviyesine çekilir.
-- **🛡️ Break-Even Koruma (Başa Baş Stop):**
-  - Fiyat kârda **+%1.50** (`break_even_trigger_pct`) seviyesine ulaştığında stop seviyesi otomatik olarak kârlı bölgeye (+%0.20 net kâr) taşınır.
-  - Böylece işlem riskten arındırılır; borsa komisyonu garanti altına alınır ve pozisyonun zararla kapanma ihtimali sıfırlanır. Telegram'a özel bildirim atılır.
-- **Trailing Take-Profit:**
-  - Fiyat `%config["trailing_trigger_pct"]` kâra ulaştığında Trailing Stop devreye girer.
-  - LONG için zirveden geriye doğru `%config["trailing_delta_pct"]` sarkarsa kâr realizasyonu yapılır.
-  - SHORT için dip fiyattan yukarıya doğru `%config["trailing_delta_pct"]` sekerse kâr realizasyonu yapılır.
-- **Zaman Aşımı (Timeout):**
-  - Pozisyon 40 dakika içinde TP veya SL olmadıysa momentumun kaybolduğu kabul edilir ("Hacim Söndü") ve anlık fiyattan kapatılır.
+- **🎯 Asimetrik Kâr Hedefleri (TP):**
+  - **LONG:** `%3.0` Trailing TP tetikleyicisi ve `%0.6` delta ile uzun trend sürüşü.
+  - **SHORT (Hızlı Scalp):** `%1.6` (`short_tp_pct`) Trailing TP tetikleyicisi ve `%0.4` sıkı delta ile kârı V-dönüşüne bırakmadan hızlı realizasyon.
+- **🛡️ Asimetrik Başabaş (Break-Even):**
+  - **LONG:** `+%1.5` kârda stop girişe (`+%0.20`) çekilir.
+  - **SHORT:** `+%1.0` (`short_break_even_trigger_pct`) kârda stop anında girişe (`-%0.15`) çekilerek pozisyon dakikalar içinde tamamen risksiz hale getirilir.
+- **⏱️ Asimetrik Zaman Aşımı (Timeout):**
+  - **LONG:** 40 dakika (`position_timeout_minutes: 40`).
+  - **SHORT:** **15 dakika** (`short_timeout_minutes: 15`). Düşüş dalgası 15 dakikada tamamlanamazsa oyalanmadan piyasadan çıkılır.
 - **💸 Gerçekçi Borsa Komisyonu (%0.12 Roundtrip):**
-  - Gerçek vadeli piyasalarda %0.05 Taker alış + %0.05 Taker satış + ortalama %0.02 slippage bulunur.
-  - Bot her kapanan işlemden net `%0.12` komisyon düşerek `paper_trades.csv`ye ve Telegram'a **Net PnL** olarak yansıtır.
+  - Taker komisyonları ve kayma payları her iki yönde de net kârdan otomatik düşülür.
 - **💾 Durum Kalıcılığı (State Persistence):**
-  - Açık pozisyonlar anlık olarak `active_positions.json` dosyasına yazılır.
-  - Bot kapatılıp açılsa bile hafıza kaybı yaşanmaz; açık sanal pozisyonlar kaldığı yerden takip edilmeye devam eder.
+  - Açık pozisyonlar ve yönleri `active_positions.json` dosyasına yazılır. Bot yeniden başlasa da pozisyon takibi kopmaz.
 
 ---
 
@@ -155,9 +146,15 @@ pip install -r requirements.txt
     "top_pairs_count": 25,
     "oi_min_increase_pct": 2.0,
     "top_trader_ls_max": 2.2,
-    "top_trader_ls_min": 0.65,
+    "top_trader_ls_min": 0.80,
     "allow_long": true,
     "allow_short": true,
+    "short_tp_pct": 1.6,
+    "short_delta_pct": 0.4,
+    "short_sl_pct": 1.5,
+    "short_timeout_minutes": 15,
+    "short_break_even_trigger_pct": 1.0,
+    "short_break_even_lock_pct": 0.15,
     "min_taker_buy_ratio": 0.55,
     "min_close_strength": 0.60,
     "use_sr_filter": true,

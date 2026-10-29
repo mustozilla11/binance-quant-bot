@@ -199,6 +199,8 @@ class PaperTradingBot:
                 "trailing_delta_pct", "max_concurrent_positions", "trade_amount_usdt",
                 "break_even_trigger_pct", "commission_pct", "oi_min_increase_pct",
                 "top_trader_ls_max", "top_trader_ls_min", "allow_long", "allow_short",
+                "short_tp_pct", "short_delta_pct", "short_sl_pct", "short_timeout_minutes",
+                "short_break_even_trigger_pct", "short_break_even_lock_pct",
                 "use_sr_filter", "min_room_to_resistance_pct", "min_room_to_support_pct",
                 "dynamic_tp_enabled", "structural_sl_enabled"
             ]
@@ -418,8 +420,12 @@ class PaperTradingBot:
 
             if is_short:
                 raw_pnl_pct = ((entry_price - curr_price) / entry_price) * 100.0
+                be_trigger = float(self.config.get("short_break_even_trigger_pct", 1.0))
+                be_lock = float(self.config.get("short_break_even_lock_pct", 0.15))
             else:
                 raw_pnl_pct = ((curr_price - entry_price) / entry_price) * 100.0
+                be_trigger = float(self.config.get("break_even_trigger_pct", 1.5))
+                be_lock = float(self.config.get("break_even_lock_pct", 0.20))
 
             duration_minutes = (now - pos.entry_time) / 60.0
 
@@ -675,8 +681,17 @@ class PaperTradingBot:
             struct_info = None
             use_sr = bool(self.config.get("use_sr_filter", True))
             entry_price = float(candle["close"])
-            default_sl = float(self.config.get("stop_loss_pct", 2.0))
-            default_tp = float(self.config.get("trailing_trigger_pct", 3.0))
+
+            if target_side == "SHORT":
+                default_sl = float(self.config.get("short_sl_pct", 1.5))
+                default_tp = float(self.config.get("short_tp_pct", 1.6))
+                delta_pct = float(self.config.get("short_delta_pct", 0.4))
+                timeout_m = int(self.config.get("short_timeout_minutes", 15))
+            else:
+                default_sl = float(self.config.get("stop_loss_pct", 2.0))
+                default_tp = float(self.config.get("trailing_trigger_pct", 3.0))
+                delta_pct = float(self.config.get("trailing_delta_pct", 0.6))
+                timeout_m = int(self.config.get("position_timeout_minutes", 40))
 
             if use_sr:
                 sr_window = int(self.config.get("sr_pivot_window", 5))
@@ -717,7 +732,10 @@ class PaperTradingBot:
                         logger.info("  ↳ [%s LONG] Yapısal Boşluk Teyidi BAŞARILI: Direnç Mesafesi %s (POC: $%.4f | Trend: %s) 🟢",
                                     symbol, res_str, struct_res.poc_price, struct_res.trend_direction)
                 else:
-                    if struct_res.is_breakdown:
+                    if struct_res.is_rejection:
+                        logger.info("  ↳ [%s SHORT] ⚡ %s TESPİT EDİLDİ (Dirençten Red / Fakeout Doğrulandı) 🟢",
+                                    symbol, struct_res.rejection_source)
+                    elif struct_res.is_breakdown:
                         logger.info("  ↳ [%s SHORT] ⚡ DESTEK KIRILIMI (BREAKDOWN) ONAYLANDI (Kırılan Destek: $%.4f) 🟢",
                                     symbol, struct_res.broken_level or 0.0)
                     else:
@@ -732,8 +750,6 @@ class PaperTradingBot:
                 tp_pct = default_tp
 
             # TÜM FİLTRELER SAĞLANDI -> SANAL POZİSYON AÇ (LONG / SHORT)
-            delta_pct = float(self.config.get("trailing_delta_pct", 1.0))
-            timeout_m = int(self.config.get("position_timeout_minutes", 40))
             trade_amount_usdt = float(self.config.get("trade_amount_usdt", 100.0))
             qty = (trade_amount_usdt / entry_price) if entry_price > 0 else 0.0
 
