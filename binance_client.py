@@ -263,6 +263,19 @@ class BinanceFuturesClient:
                 pass
         return None
 
+    def get_24h_change_pct(self, symbol: str) -> Optional[float]:
+        """
+        Sembolün son 24 saatlik fiyat değişim yüzdesini döndürür (/fapi/v1/ticker/24hr).
+        Aşırı şişmiş parabolik pump coinlerini tespit etmek için kullanılır.
+        """
+        data = self._request("/fapi/v1/ticker/24hr", params={"symbol": symbol})
+        if data and isinstance(data, dict) and "priceChangePercent" in data:
+            try:
+                return float(data["priceChangePercent"])
+            except (ValueError, TypeError):
+                pass
+        return None
+
     def get_latest_price(self, symbol: str) -> Optional[float]:
         """
         Tek bir sembolün güncel fiyatını getirir.

@@ -74,7 +74,8 @@ class Position:
     trailing_active: bool = False
     break_even_active: bool = False
     peak_price: float = 0.0
-    peak_pnl_pct: float = 0.0
+    peak_pnl_pct: float = 0.0     # MFE (Maximum Favorable Excursion)
+    mae_pnl_pct: float = 0.0      # MAE (Maximum Adverse Excursion)
     nearest_support: Optional[float] = None
     nearest_resistance: Optional[float] = None
     poc_price: Optional[float] = None
@@ -166,10 +167,12 @@ class PaperTradingBot:
     def _log_trade_to_csv(self, trade_record: Dict[str, Any]) -> None:
         """Kapanan işlemi paper_trades.csv dosyasına ekler."""
         try:
+            write_header = not os.path.exists(CSV_PATH) or os.path.getsize(CSV_PATH) == 0
             df = pd.DataFrame([trade_record])
-            df.to_csv(CSV_PATH, mode="a", header=False, index=False, encoding="utf-8")
-            logger.info("İşlem CSV defterine kaydedildi: %s | Net PnL: %%%.2f ($%.2f USDT)",
-                        trade_record["symbol"], trade_record["pnl_pct"], trade_record["pnl_usd"])
+            df.to_csv(CSV_PATH, mode="a", header=write_header, index=False, encoding="utf-8")
+            logger.info("İşlem CSV defterine kaydedildi: %s | Net PnL: %%%.2f ($%.2f USDT) | MFE: +%%%.2f | MAE: %%%.2f",
+                        trade_record["symbol"], trade_record["pnl_pct"], trade_record.get("pnl_usd", 0.0),
+                        trade_record.get("mfe_pct", 0.0), trade_record.get("mae_pct", 0.0))
         except Exception as e:
             logger.error("CSV kayıt hatası: %s", e)
 
@@ -399,6 +402,17 @@ class PaperTradingBot:
             best_trade = float(df["pnl_pct"].max())
             worst_trade = float(df["pnl_pct"].min())
 
+            mfe_col = "mfe_pct" if "mfe_pct" in df.columns else ("peak_pnl_pct" if "peak_pnl_pct" in df.columns else None)
+            mfe_line = ""
+            if mfe_col:
+                avg_mfe = float(pd.to_numeric(df[mfe_col], errors="coerce").fillna(0.0).mean())
+                mfe_line = f"• Ortalama Zirve Kâr (MFE): `+%{avg_mfe:.2f}`\n"
+
+            mae_line = ""
+            if "mae_pct" in df.columns:
+                avg_mae = float(pd.to_numeric(df["mae_pct"], errors="coerce").fillna(0.0).mean())
+                mae_line = f"• Ortalama En Derin Düşüş (MAE): `%{avg_mae:.2f}`\n"
+
             msg = (
                 "📈 *GENEL PAPER TRADING PERFORMANS RAPORU*\n"
                 "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -407,6 +421,8 @@ class PaperTradingBot:
                 f"• Kazançlı / Kayıplı: `{len(winning)}` / `{len(losing)}`\n"
                 f"• Net Toplam Kâr/Zarar: *${total_pnl_usd:+.2f} USDT*\n"
                 f"• Ödenen Sanal Komisyon: `${total_comm_usd:.2f} USDT`\n"
+                f"{mfe_line}"
+                f"{mae_line}"
                 f"• En İyi İşlem: `%{best_trade:+.2f}`\n"
                 f"• En Kötü İşlem: `%{worst_trade:+.2f}`\n"
                 "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -475,12 +491,14 @@ class PaperTradingBot:
                 "exit_price": round(curr_price, 6),
                 "qty": round(pos.qty, 6),
                 "amount_usdt": round(pos.amount_usdt, 2),
+                "gross_pnl_pct": round(gross_pnl_pct, 2),
                 "pnl_pct": round(net_pnl_pct, 2),
                 "pnl_usd": round(net_pnl_usd, 2),
                 "commission_usd": round(comm_usd, 2),
                 "duration_minutes": round(duration_minutes, 1),
                 "exit_reason": "MANUEL_TELEGRAM (/kapat)",
-                "peak_pnl_pct": round(pos.peak_pnl_pct, 2)
+                "mfe_pct": round(pos.peak_pnl_pct, 2),
+                "mae_pct": round(pos.mae_pnl_pct, 2)
             }
 
             self._log_trade_to_csv(trade_record)
@@ -530,18 +548,22 @@ class PaperTradingBot:
 
             duration_minutes = (now - pos.entry_time) / 60.0
 
-            # 1. Zirve fiyat ve kâr takibi
+            # 1. Zirve kâr (MFE) ve dip zarar (MAE) takibi
             if pos.peak_price == 0.0:
                 pos.peak_price = entry_price
 
+            if raw_pnl_pct > pos.peak_pnl_pct:
+                pos.peak_pnl_pct = raw_pnl_pct
+
+            if raw_pnl_pct < pos.mae_pnl_pct:
+                pos.mae_pnl_pct = raw_pnl_pct
+
             if is_short:
-                if curr_price < pos.peak_price or pos.peak_pnl_pct == 0.0:
+                if curr_price < pos.peak_price:
                     pos.peak_price = curr_price
-                    pos.peak_pnl_pct = raw_pnl_pct
             else:
-                if curr_price > pos.peak_price or pos.peak_pnl_pct == 0.0:
+                if curr_price > pos.peak_price:
                     pos.peak_price = curr_price
-                    pos.peak_pnl_pct = raw_pnl_pct
 
             # 2. Başabaş (Break-Even) Koruma Kontrolü
             if not pos.break_even_active and pos.peak_pnl_pct >= be_trigger:
@@ -605,20 +627,20 @@ class PaperTradingBot:
                     "exit_price": round(exit_price, 6),
                     "qty": round(pos.qty, 6),
                     "amount_usdt": round(pos.amount_usdt, 2),
+                    "gross_pnl_pct": round(gross_pnl_pct, 2),
                     "pnl_pct": round(net_pnl_pct, 2),
                     "pnl_usd": round(net_pnl_usd, 2),
                     "commission_usd": round(comm_usd, 2),
                     "duration_minutes": round(duration_minutes, 1),
                     "exit_reason": exit_reason,
-                    "peak_pnl_pct": round(pos.peak_pnl_pct, 2)
+                    "mfe_pct": round(pos.peak_pnl_pct, 2),
+                    "mae_pct": round(pos.mae_pnl_pct, 2)
                 }
 
                 logger.info("🔴 [%s (%s) Pozisyon Kapatıldı] Neden: %s | Net PnL: %%%.2f ($%.2f USDT) | Süre: %.1f dk",
                             symbol, pos.side, exit_reason, net_pnl_pct, net_pnl_usd, duration_minutes)
 
                 self._log_trade_to_csv(trade_record)
-                self.notifier.notify_trade_closed(trade_record)
-                symbols_to_close.append(symbol)
                 self.notifier.notify_trade_closed(trade_record)
                 symbols_to_close.append(symbol)
 
@@ -681,7 +703,7 @@ class PaperTradingBot:
                     return
 
         now = time.time()
-        cooldown_sec = float(self.config.get("cooldown_minutes", 30)) * 60.0
+        cooldown_sec = float(self.config.get("cooldown_minutes", 60)) * 60.0
         vol_mult_threshold = float(self.config.get("volume_multiplier", 2.8))
         min_oi_increase = float(self.config.get("oi_min_increase_pct", 2.0))
         max_ls_ratio = float(self.config.get("top_trader_ls_max", 2.2))
@@ -689,7 +711,13 @@ class PaperTradingBot:
         allow_long = bool(self.config.get("allow_long", True))
         allow_short = bool(self.config.get("allow_short", True))
         min_taker_ratio = float(self.config.get("min_taker_buy_ratio", 0.58))
-        min_close_str = float(self.config.get("min_close_strength", 0.60))
+        min_close_str = float(self.config.get("min_close_strength", 0.65))
+        max_24h_pump = float(self.config.get("max_24h_pump_pct", 60.0))
+        max_allowed_atr = float(self.config.get("max_allowed_atr_pct", 4.5))
+
+        # Portföy Yön Dengesi: Halihazırdaki açık yönlerin dağılımı
+        open_shorts = sum(1 for p in self.active_positions.values() if p.side == "SHORT")
+        open_longs = sum(1 for p in self.active_positions.values() if p.side == "LONG")
 
         for symbol in top_pairs:
             if not self.is_running:
@@ -739,7 +767,25 @@ class PaperTradingBot:
             else:
                 continue
 
-            # 2. Filtre: Taker Hacim Baskısı (Alıcı veya Satıcı Baskısı Oranı >= %55)
+            # Portföy Yön Dengesi: 4+ SHORT açıkken genel düşüş piyasasında ters yöne LONG açılmasını sınırla
+            if target_side == "LONG" and open_shorts >= 4:
+                fr = self.client.get_funding_rate(symbol)
+                if fr is None or fr > -0.01:
+                    logger.info("  ↳ [%s LONG] Portföyde %d adet SHORT pozisyon açık. Piyasa yön çatışması engellendi 🛑", symbol, open_shorts)
+                    continue
+            elif target_side == "SHORT" and open_longs >= 4:
+                logger.info("  ↳ [%s SHORT] Portföyde %d adet LONG pozisyon açık. Piyasa yön çatışması engellendi 🛑", symbol, open_longs)
+                continue
+
+            # Parabolik 24s Pump Koruması (TRB / Absürt Şişme Tuzağı Engeli)
+            if target_side == "LONG":
+                chg_24h = self.client.get_24h_change_pct(symbol)
+                if chg_24h is not None and chg_24h >= max_24h_pump:
+                    logger.info("  ↳ [%s LONG] 24s Değişim Aşırı Yüksek (+%%%.1f >= +%%%.1f). Parabolik tepe / TRB tuzağı engellendi 🛑",
+                                symbol, chg_24h, max_24h_pump)
+                    continue
+
+            # 2. Filtre: Taker Hacim Baskısı (Alıcı veya Satıcı Baskısı Oranı >= %58)
             taker_buy_vol = float(candle.get("taker_buy_volume", 0.0))
             if target_side == "LONG":
                 taker_ratio = (taker_buy_vol / candle["volume"]) if candle["volume"] > 0 else 0.0
@@ -879,6 +925,11 @@ class PaperTradingBot:
 
                 if not struct_res.has_room_to_run:
                     logger.info("  ↳ [%s %s] %s. İşlem İptal Edildi 🛑", symbol, target_side, struct_res.rejection_reason)
+                    continue
+
+                if struct_res.atr_pct > max_allowed_atr:
+                    logger.info("  ↳ [%s %s] ATR(14) aşırı yüksek (%%%.2f > %%%.2f). Tahta delinmesi / kontrolsüz volatilite riski. Reddedildi 🛑",
+                                symbol, target_side, struct_res.atr_pct, max_allowed_atr)
                     continue
 
                 if target_side == "LONG":
