@@ -1,2 +1,2 @@
-timestamp,symbol,side,entry_price,exit_price,qty,amount_usdt,pnl_pct,pnl_usd,duration_minutes,exit_reason,peak_pnl_pct,commission_usd
-2026-10-28T19:44:41.847953,BZUSDT,LONG,112.57,112.44,-0.12,40.1,ZAMAN_ASIMI (Hacim Söndü),0.1,,,,0.0
+timestamp,symbol,side,entry_price,exit_price,qty,amount_usdt,pnl_pct,pnl_usd,commission_usd,duration_minutes,exit_reason,peak_pnl_pct
+2026-10-28T19:44:41.847953,BZUSDT,LONG,112.57,112.44,0.888336,100.0,-0.12,-0.12,0.12,40.1,ZAMAN_ASIMI (Hacim Söndü),0.10

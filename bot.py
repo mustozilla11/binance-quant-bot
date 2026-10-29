@@ -362,16 +362,38 @@ class PaperTradingBot:
                 self.notifier.send_message("ℹ️ Henüz tamamlanmış işlem kaydı bulunmuyor.")
                 return
 
+            if "pnl_pct" not in df.columns:
+                self.notifier.send_message("⚠️ CSV defterinde 'pnl_pct' sütunu bulunamadı.")
+                return
+
+            # Sayısal dönüşümleri zorunlu yap (hatalı / kaymış satırları güvenle ayıkla)
+            df["pnl_pct"] = pd.to_numeric(df["pnl_pct"], errors="coerce")
+            df = df.dropna(subset=["pnl_pct"])
+
+            if df.empty:
+                self.notifier.send_message("ℹ️ Henüz tamamlanmış geçerli işlem kaydı bulunmuyor.")
+                return
+
             total_trades = len(df)
             winning = df[df["pnl_pct"] > 0]
             losing = df[df["pnl_pct"] <= 0]
 
             win_rate = (len(winning) / total_trades) * 100.0 if total_trades > 0 else 0.0
-            total_pnl_usd = df["pnl_usd"].sum() if "pnl_usd" in df.columns else (df["pnl_pct"].sum())
-            total_comm_usd = df["commission_usd"].sum() if "commission_usd" in df.columns else 0.0
 
-            best_trade = df["pnl_pct"].max()
-            worst_trade = df["pnl_pct"].min()
+            if "pnl_usd" in df.columns:
+                df["pnl_usd"] = pd.to_numeric(df["pnl_usd"], errors="coerce").fillna(0.0)
+                total_pnl_usd = float(df["pnl_usd"].sum())
+            else:
+                total_pnl_usd = float(df["pnl_pct"].sum())
+
+            if "commission_usd" in df.columns:
+                df["commission_usd"] = pd.to_numeric(df["commission_usd"], errors="coerce").fillna(0.0)
+                total_comm_usd = float(df["commission_usd"].sum())
+            else:
+                total_comm_usd = 0.0
+
+            best_trade = float(df["pnl_pct"].max())
+            worst_trade = float(df["pnl_pct"].min())
 
             msg = (
                 "📈 *GENEL PAPER TRADING PERFORMANS RAPORU*\n"
@@ -388,6 +410,7 @@ class PaperTradingBot:
             )
             self.notifier.send_message(msg)
         except Exception as e:
+            logger.error("Rapor oluşturma hatası: %s", e)
             self.notifier.send_message(f"⚠️ Rapor hesaplanırken hata oluştu: {e}")
 
     def update_and_check_positions(self) -> None:
