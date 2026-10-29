@@ -18,6 +18,7 @@
 | File | Primary Responsibility | Key Functions / Classes |
 | :--- | :--- | :--- |
 | [`bot.py`](file:///home/mustafao/.gemini/antigravity/scratch/binance_quant_bot/bot.py) | Main trading orchestrator, position lifecycle, trailing stop, MFE/MAE tracking, Telegram command handler. | `PaperTradingBot`, `Position` dataclass, `scan_market()`, `update_and_check_positions()` |
+| [`market_regime.py`](file:///home/mustafao/.gemini/antigravity/scratch/binance_quant_bot/market_regime.py) | Autonomous market regime detection (BULL / BEAR / CHOP / UNCERTAIN) via BTC 4H EMA/ADX, market breadth, 3-step hysteresis. | `MarketRegimeDetector`, `calculate_adx()`, `get_regime_params()` |
 | [`market_structure.py`](file:///home/mustafao/.gemini/antigravity/scratch/binance_quant_bot/market_structure.py) | Quant analytics: Fractal S/R clustering, Volume Profile (POC), Wilder RSI, HTF (1H) EMA trend, ATR-based dynamic TP/SL. | `analyze_market_structure()`, `find_sr_clusters()`, `calculate_volume_profile_poc()`, `calculate_atr()`, `calculate_rsi()` |
 | [`binance_client.py`](file:///home/mustafao/.gemini/antigravity/scratch/binance_quant_bot/binance_client.py) | REST API client for Binance Futures endpoints with CloudFront backup failover & in-memory TTL caching. | `BinanceFuturesClient`, `get_top_volume_pairs()`, `get_open_interest_change()`, `get_top_trader_long_short_ratio()`, `get_funding_rate()`, `get_24h_change_pct()` |
 | [`optimizer.py`](file:///home/mustafao/.gemini/antigravity/scratch/binance_quant_bot/optimizer.py) | Walk-Forward Self-Optimization engine using train/test splits (70/30) & Grid Search on 14-day historical 15m klines. | `run_optimization()`, `evaluate_params_on_data()`, updates `config.json` |
@@ -76,6 +77,7 @@
 
 * `/durum`: Real-time status of open positions, current prices, live PnL %, peak PnL, duration.
 * `/rapor` or `/ozet`: Comprehensive performance summary (Win Rate, Net PnL USDT, Sanal Komisyon, Avg MFE, Avg MAE, Best/Worst trade).
+* `/rejim`: Market regime status, BTC macro indicators, breadth %, score, and subcommands (`/rejim kapat`, `/rejim ac`, `/rejim boga`, `/rejim ayi`, `/rejim yatay`, `/rejim sifirla`).
 * `/kapat <SEMBOL>`: Instantly closes a specific position at market price (e.g. `/kapat SOLUSDT`).
 * `/kapat hepsi`: Emergency liquidation of all active positions.
 

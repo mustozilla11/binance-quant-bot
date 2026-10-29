@@ -39,6 +39,7 @@ from binance_client import BinanceFuturesClient
 from telegram_notifier import TelegramNotifier
 from optimizer import run_optimization, load_config, CONFIG_PATH
 from market_structure import analyze_market_structure, MarketStructureResult
+from market_regime import MarketRegimeDetector
 
 # Loglama Konfigürasyonu
 LOG_PATH = os.path.join(SCRIPT_DIR, "bot.log")
@@ -101,6 +102,12 @@ class PaperTradingBot:
         self.notifier = TelegramNotifier(
             token=self.config.get("telegram_token", ""),
             chat_id=self.config.get("telegram_chat_id", "")
+        )
+
+        # Otomatik Piyasa Rejim Yöneticisi (Boğa / Ayı / Yatay / Belirsiz)
+        self.regime_detector = MarketRegimeDetector(
+            client=self.client,
+            notifier=self.notifier
         )
 
         # Aktif sanal pozisyonlar: symbol -> Position (Diskten yükle)
@@ -299,6 +306,8 @@ class PaperTradingBot:
                             self._handle_cmd_status()
                         elif text in ["/rapor", "/ozet"]:
                             self._handle_cmd_report()
+                        elif text.startswith("/rejim"):
+                            self._handle_cmd_regime(text)
                         elif text.startswith("/kapat"):
                             self._handle_cmd_close(text)
                         elif text in ["/yardim", "/help", "/start"]:
@@ -307,6 +316,7 @@ class PaperTradingBot:
                                 "━━━━━━━━━━━━━━━━━━━━━\n"
                                 "• `/durum` - Açık sanal pozisyonları ve anlık PnL durumunu gösterir\n"
                                 "• `/rapor` (veya `/ozet`) - Genel kâr/zarar karnesini döner\n"
+                                "• `/rejim` - Piyasa rejimi (Boğa/Ayı/Yatay) durumu ve kontrolü\n"
                                 "• `/kapat <SEMBOL>` - Açık pozisyonu anında kapatır (örn: `/kapat SOLUSDT`)\n"
                                 "• `/kapat hepsi` - Tüm açık pozisyonları tek tuşla kapatır\n"
                                 "• `/yardim` - Bu menüyü gösterir"
@@ -432,6 +442,56 @@ class PaperTradingBot:
         except Exception as e:
             logger.error("Rapor oluşturma hatası: %s", e)
             self.notifier.send_message(f"⚠️ Rapor hesaplanırken hata oluştu: {e}")
+
+    def _handle_cmd_regime(self, text: str) -> None:
+        """
+        /rejim komutu ve alt komutları:
+        • /rejim -> Detaylı rejim raporu
+        • /rejim kapat -> Rejim sistemini kapatır (statik ayarlar)
+        • /rejim ac -> Rejim sistemini açar
+        • /rejim boga -> Manuel Boğa moduna kilitler
+        • /rejim ayi -> Manuel Ayı moduna kilitler
+        • /rejim yatay -> Manuel Yatay moduna kilitler
+        • /rejim sifirla -> Manuel kilidi kaldırıp otomatiğe döner
+        """
+        parts = text.strip().split()
+        if len(parts) == 1:
+            summary = self.regime_detector.get_summary()
+            self.notifier.send_message(summary)
+            return
+
+        subcmd = parts[1].lower().strip()
+        if subcmd == "kapat":
+            res = self.regime_detector.set_enabled(False)
+            self.notifier.send_message(res)
+        elif subcmd in ["ac", "aç"]:
+            res = self.regime_detector.set_enabled(True)
+            self.notifier.send_message(res)
+        elif subcmd in ["boga", "boğa", "bull"]:
+            res = self.regime_detector.set_manual_override("BULL")
+            self.notifier.send_message(res)
+        elif subcmd in ["ayi", "ayı", "bear"]:
+            res = self.regime_detector.set_manual_override("BEAR")
+            self.notifier.send_message(res)
+        elif subcmd in ["yatay", "chop", "testere"]:
+            res = self.regime_detector.set_manual_override("CHOP")
+            self.notifier.send_message(res)
+        elif subcmd in ["sifirla", "sıfırla", "auto", "otomatik"]:
+            res = self.regime_detector.set_manual_override(None)
+            self.notifier.send_message(res)
+        else:
+            help_text = (
+                "⚠️ *Bilinmeyen Rejim Komutu!*\n"
+                "Kullanım:\n"
+                "• `/rejim` - Canlı piyasa rejim raporu\n"
+                "• `/rejim kapat` - Otomatik rejimi devre dışı bırakır\n"
+                "• `/rejim ac` - Otomatik rejimi aktif eder\n"
+                "• `/rejim boga` - Boğa moduna kilitler\n"
+                "• `/rejim ayi` - Ayı moduna kilitler\n"
+                "• `/rejim yatay` - Yatay/Testere moduna kilitler\n"
+                "• `/rejim sifirla` - Otomatik analize geri döner"
+            )
+            self.notifier.send_message(help_text)
 
     def _handle_cmd_close(self, text: str) -> None:
         """
@@ -608,6 +668,24 @@ class PaperTradingBot:
                 exit_reason = "ZAMAN_ASIMI (Hacim Söndü)"
                 exit_price = curr_price
 
+            # Koşul D: Fonlama Tepe Tıkanması (Funding Exhaustion)
+            elif not is_short and pos.peak_pnl_pct >= 0.5:
+                regime_p = self.regime_detector.get_regime_params()
+                action = regime_p.get("funding_exhaustion_action", "EXIT_EARLY")
+                fr = self.client.get_funding_rate(symbol)
+                if fr is not None and fr >= 0.0005:  # +%0.05 ve üzeri aşırı pozitif fonlama
+                    if action == "EXIT_EARLY" and raw_pnl_pct >= 0.5:
+                        exit_reason = f"FONLAMA_TIKANMASI (+%{fr*100:.3f})"
+                        exit_price = curr_price
+                    elif action == "TIGHTEN_TRAILING":
+                        tight_delta = float(regime_p.get("funding_exhaustion_trailing_delta", 0.2))
+                        if pos.tp_delta_pct > tight_delta:
+                            pos.tp_delta_pct = tight_delta
+                            if not pos.trailing_active:
+                                pos.trailing_active = True
+                            logger.info("🔥 [%s LONG] Yüksek Fonlama (+%%%.3f)! Trailing Stop %%0.2'ye sıkılaştırıldı.",
+                                        symbol, fr * 100)
+
             # Kapanış gerekiyorsa uygula
             if exit_reason:
                 if is_short:
@@ -659,19 +737,23 @@ class PaperTradingBot:
         5. Top Trader L/S Oranı <= 2.2 (Sıkışma/Kalabalık long riski filtresi)
         6. Cooldown: Aynı pariteye 30 dakika içinde ikinci sinyal üretilmez
         """
-        max_positions = int(self.config.get("max_concurrent_positions", 0))
+        # Piyasa Rejim Analizini Güncelle
+        regime_analysis = self.regime_detector.update()
+        regime_params = self.regime_detector.get_regime_params()
+
+        max_positions = regime_params.get("max_concurrent_positions", int(self.config.get("max_concurrent_positions", 5)))
         is_unlimited = (max_positions <= 0)
         current_open = len(self.active_positions)
 
         if not is_unlimited and current_open >= max_positions:
-            logger.info("Maksimum eşzamanlı pozisyon sayısına ulaşıldı (%d/%d). Yeni tarama atlanıyor.",
-                        current_open, max_positions)
+            logger.info("Maksimum eşzamanlı pozisyon sayısına ulaşıldı (%d/%d - Rejim: %s). Yeni tarama atlanıyor.",
+                        current_open, max_positions, self.regime_detector.current_regime)
             return
 
         top_n = int(self.config.get("top_pairs_count", 25))
         blacklist = set(self.config.get("blacklist", []))
         top_pairs = self.client.get_top_volume_pairs(limit=top_n, blacklist=blacklist)
-        lim_str = "Sınırsız (Unlimited)" if is_unlimited else f"{current_open}/{max_positions}"
+        lim_str = "Sınırsız (Unlimited)" if is_unlimited else f"{current_open}/{max_positions} [{self.regime_detector.current_regime}]"
         logger.info("Piyasa taranıyor: Top %d parite analiz ediliyor (Açık Pozisyonlar: %d | Limit: %s)...",
                     len(top_pairs), current_open, lim_str)
 
@@ -708,10 +790,10 @@ class PaperTradingBot:
         min_oi_increase = float(self.config.get("oi_min_increase_pct", 2.0))
         max_ls_ratio = float(self.config.get("top_trader_ls_max", 2.2))
         min_ls_ratio = float(self.config.get("top_trader_ls_min", 0.65))
-        allow_long = bool(self.config.get("allow_long", True))
-        allow_short = bool(self.config.get("allow_short", True))
+        allow_long = regime_params.get("allow_long", bool(self.config.get("allow_long", True)))
+        allow_short = regime_params.get("allow_short", bool(self.config.get("allow_short", True)))
         min_taker_ratio = float(self.config.get("min_taker_buy_ratio", 0.58))
-        min_close_str = float(self.config.get("min_close_strength", 0.65))
+        min_close_str = max(float(self.config.get("min_close_strength", 0.65)), regime_params.get("min_close_strength", 0.65))
         max_24h_pump = float(self.config.get("max_24h_pump_pct", 60.0))
         max_allowed_atr = float(self.config.get("max_allowed_atr_pct", 4.5))
 
@@ -760,9 +842,17 @@ class PaperTradingBot:
             is_bearish = candle["close"] < candle["open"]
 
             target_side = None
-            if allow_long and is_bullish:
-                target_side = "LONG"
-            elif allow_short and is_bearish:
+            if is_bullish:
+                if allow_long:
+                    target_side = "LONG"
+                elif self.regime_detector.current_regime == "BEAR":
+                    fr = self.client.get_funding_rate(symbol)
+                    squeeze_th = float(self.config.get("squeeze_funding_rate_threshold", -0.01))
+                    if fr is not None and fr <= squeeze_th:
+                        logger.info("  ↳ [%s LONG] 🐻 AYI Rejiminde İstisnai SHORT SQUEEZE Girişi İzni Verildi (Fonlama: %%%.4f) 🚀",
+                                    symbol, fr)
+                        target_side = "LONG"
+            elif is_bearish and allow_short:
                 target_side = "SHORT"
             else:
                 continue
@@ -859,12 +949,12 @@ class PaperTradingBot:
             if target_side == "SHORT":
                 default_sl = float(self.config.get("short_sl_pct", 1.5))
                 default_tp = float(self.config.get("short_tp_pct", 1.6))
-                delta_pct = float(self.config.get("short_delta_pct", 0.4))
+                delta_pct = float(regime_params.get("trailing_delta_pct", self.config.get("short_delta_pct", 0.4)))
                 timeout_m = int(self.config.get("short_timeout_minutes", 15))
             else:
                 default_sl = float(self.config.get("stop_loss_pct", 2.0))
                 default_tp = float(self.config.get("trailing_trigger_pct", 3.0))
-                delta_pct = float(self.config.get("trailing_delta_pct", 0.6))
+                delta_pct = float(regime_params.get("trailing_delta_pct", self.config.get("trailing_delta_pct", 0.6)))
                 timeout_m = int(self.config.get("position_timeout_minutes", 40))
 
             if use_sr:
@@ -883,8 +973,8 @@ class PaperTradingBot:
 
                 use_atr_sl = bool(self.config.get("use_atr_dynamic_sl", True))
                 atr_per = int(self.config.get("atr_period", 14))
-                atr_mult = float(self.config.get("atr_sl_multiplier", 2.0))
-                atr_tp_mult = float(self.config.get("atr_tp_multiplier", 2.5))
+                atr_mult = float(regime_params.get("atr_sl_multiplier", self.config.get("atr_sl_multiplier", 2.0)))
+                atr_tp_mult = float(regime_params.get("atr_tp_multiplier", self.config.get("atr_tp_multiplier", 2.5)))
                 min_sl = float(self.config.get("min_sl_pct", 1.0))
                 max_sl = float(self.config.get("max_sl_pct", 3.5))
                 max_candle_atr = float(self.config.get("max_candle_atr_ratio", 3.0))
@@ -931,6 +1021,14 @@ class PaperTradingBot:
                     logger.info("  ↳ [%s %s] ATR(14) aşırı yüksek (%%%.2f > %%%.2f). Tahta delinmesi / kontrolsüz volatilite riski. Reddedildi 🛑",
                                 symbol, target_side, struct_res.atr_pct, max_allowed_atr)
                     continue
+
+                # Sahte Kırılım (Sweep / Fakeout) Koruması (Yatay / Ayı / Belirsiz rejimlerinde aktif)
+                sweep_mode = regime_params.get("sweep_filter_mode", "STRICT")
+                if sweep_mode == "STRICT" and target_side == "LONG":
+                    if struct_res.nearest_resistance and candle["high"] > struct_res.nearest_resistance and candle["close"] < struct_res.nearest_resistance:
+                        logger.info("  ↳ [%s LONG] 🛑 LİKİDASYON AVI (SWEEP / FAKEOUT) TESPİT EDİLDİ: Fiyat direnci delip ($%.4f) altına sarktı. Sahte kırılım engellendi.",
+                                    symbol, struct_res.nearest_resistance)
+                        continue
 
                 if target_side == "LONG":
                     if struct_res.is_short_squeeze:

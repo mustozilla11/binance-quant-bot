@@ -15,6 +15,7 @@ __pycache__/
 *.log
 bot.log
 active_positions.json
+regime_state.json
 
 # OS generated files
 .DS_Store
