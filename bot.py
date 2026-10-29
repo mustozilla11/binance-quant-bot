@@ -725,9 +725,24 @@ class PaperTradingBot:
                 struct_sl = bool(self.config.get("structural_sl_enabled", True))
                 prev_c = float(df["close"].iloc[-2]) if len(df) >= 2 else None
 
+                use_htf = bool(self.config.get("use_htf_filter", True))
+                df_1h = None
+                if use_htf:
+                    df_1h = self.client.get_klines(symbol, interval="1h", limit=100, cache_ttl_sec=300)
+
+                use_atr_sl = bool(self.config.get("use_atr_dynamic_sl", True))
+                atr_per = int(self.config.get("atr_period", 14))
+                atr_mult = float(self.config.get("atr_sl_multiplier", 1.8))
+                min_sl = float(self.config.get("min_sl_pct", 1.0))
+                max_sl = float(self.config.get("max_sl_pct", 3.5))
+                max_candle_atr = float(self.config.get("max_candle_atr_ratio", 3.0))
+                max_l_rsi = float(self.config.get("max_long_rsi", 78.0))
+                min_s_rsi = float(self.config.get("min_short_rsi", 22.0))
+
                 struct_res = analyze_market_structure(
                     symbol=symbol,
                     df=df,
+                    df_1h=df_1h,
                     current_price=entry_price,
                     prev_close=prev_c,
                     side=target_side,
@@ -738,7 +753,16 @@ class PaperTradingBot:
                     default_tp_pct=default_tp,
                     default_sl_pct=default_sl,
                     dynamic_tp_enabled=dyn_tp,
-                    structural_sl_enabled=struct_sl
+                    structural_sl_enabled=struct_sl,
+                    use_htf_filter=use_htf,
+                    use_atr_dynamic_sl=use_atr_sl,
+                    atr_period=atr_per,
+                    atr_sl_multiplier=atr_mult,
+                    min_sl_pct=min_sl,
+                    max_sl_pct=max_sl,
+                    max_candle_atr_ratio=max_candle_atr,
+                    max_long_rsi=max_l_rsi,
+                    min_short_rsi=min_s_rsi
                 )
                 struct_info = struct_res.to_dict()
 
@@ -752,8 +776,8 @@ class PaperTradingBot:
                                     symbol, struct_res.broken_level or 0.0)
                     else:
                         res_str = f"+%{struct_res.dist_to_resistance_pct:.2f}" if struct_res.dist_to_resistance_pct else "Açık Yol"
-                        logger.info("  ↳ [%s LONG] Yapısal Boşluk Teyidi BAŞARILI: Direnç Mesafesi %s (POC: $%.4f | Trend: %s) 🟢",
-                                    symbol, res_str, struct_res.poc_price, struct_res.trend_direction)
+                        logger.info("  ↳ [%s LONG] Yapısal & Makro Teyit BAŞARILI: Direnç %s | ATR(14): %%%.2f | RSI: %.1f | 1H: %s 🟢",
+                                    symbol, res_str, struct_res.atr_pct, struct_res.rsi_value, struct_res.htf_bias)
                 else:
                     if struct_res.is_rejection:
                         logger.info("  ↳ [%s SHORT] ⚡ %s TESPİT EDİLDİ (Dirençten Red / Fakeout Doğrulandı) 🟢",
@@ -763,8 +787,8 @@ class PaperTradingBot:
                                     symbol, struct_res.broken_level or 0.0)
                     else:
                         sup_str = f"-%{struct_res.dist_to_support_pct:.2f}" if struct_res.dist_to_support_pct else "Açık Taban"
-                        logger.info("  ↳ [%s SHORT] Yapısal Boşluk Teyidi BAŞARILI: Destek Mesafesi %s (POC: $%.4f | Trend: %s) 🟢",
-                                    symbol, sup_str, struct_res.poc_price, struct_res.trend_direction)
+                        logger.info("  ↳ [%s SHORT] Yapısal & Makro Teyit BAŞARILI: Destek %s | ATR(14): %%%.2f | RSI: %.1f | 1H: %s 🟢",
+                                    symbol, sup_str, struct_res.atr_pct, struct_res.rsi_value, struct_res.htf_bias)
 
                 sl_pct = struct_res.suggested_sl_pct
                 tp_pct = struct_res.suggested_tp_pct
@@ -815,7 +839,11 @@ class PaperTradingBot:
             logger.info("✅ %s [YENİ SANAL %s] %s @ $%.4f ($%.2f USDT, Miktar: %.4f) | SL: $%.4f (%%%s) | TP Tetik: $%.4f (%%%s)",
                         side_emoji, target_side, symbol, entry_price, trade_amount_usdt, qty, sl_price, sl_pct, tp_trigger_price, tp_pct)
 
-            # Telegram Sinyal Kartı İlet
+            # Telegram Sinyal Kartı İlet (Dinamik hesaplanan SL ve TP yüzdeleriyle)
+            card_cfg = dict(self.config)
+            card_cfg["stop_loss_pct"] = sl_pct
+            card_cfg["trailing_trigger_pct"] = tp_pct
+
             self.notifier.notify_signal_card(
                 symbol=symbol,
                 entry_price=entry_price,
@@ -824,7 +852,7 @@ class PaperTradingBot:
                 ls_ratio=ls_ratio,
                 sl_price=sl_price,
                 tp_trigger_price=tp_trigger_price,
-                config=self.config,
+                config=card_cfg,
                 structure_info=struct_info,
                 side=target_side
             )

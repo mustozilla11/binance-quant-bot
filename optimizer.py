@@ -76,6 +76,17 @@ DEFAULT_CONFIG = {
     "min_room_to_support_pct": 1.2,
     "dynamic_tp_enabled": True,
     "structural_sl_enabled": True,
+    "use_htf_filter": True,
+    "htf_interval": "1h",
+    "use_atr_dynamic_sl": True,
+    "atr_period": 14,
+    "atr_sl_multiplier": 1.8,
+    "min_sl_pct": 1.0,
+    "max_sl_pct": 3.5,
+    "max_candle_atr_ratio": 3.0,
+    "max_long_rsi": 78.0,
+    "min_short_rsi": 22.0,
+    "walk_forward_train_ratio": 0.70,
     "blacklist": [
         "BZUSDT",
         "XAUUSDT",
@@ -372,24 +383,97 @@ class WalkForwardOptimizer:
 
         return selected[:count]
 
-    def fetch_14d_klines(self, pairs: List[str]) -> Dict[str, pd.DataFrame]:
+    @staticmethod
+    def evaluate_trades(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        Her parite için son 5 günlük 5m mum verilerini çeker (1500 mum/parite).
-        SMA(20) hacim indikatörünü saf pandas ile hesaplar (pandas-ta gerektirmez).
+        İşlem listesinin kâr faktörü, kazanma oranı ve maksimum drawdown metriklerini hesaplar.
         """
-        logger.info("Son 5 günlük 5m mum verileri indiriliyor (Pariteler: %s)...", pairs)
+        total_trades = len(trades)
+        if total_trades == 0:
+            return {
+                "profit_factor": 0.0,
+                "win_rate": 0.0,
+                "max_drawdown": 100.0,
+                "total_trades": 0,
+                "gross_profit": 0.0,
+                "gross_loss": 0.0,
+                "score": 0.0
+            }
+
+        winning = [t for t in trades if t["pnl_pct"] > 0]
+        losing = [t for t in trades if t["pnl_pct"] <= 0]
+
+        gross_profit = sum(t["pnl_pct"] for t in winning)
+        gross_loss = abs(sum(t["pnl_pct"] for t in losing))
+
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        else:
+            profit_factor = gross_profit if gross_profit > 0 else 1.0
+
+        win_rate = (len(winning) / total_trades) * 100.0
+
+        # Kümülatif getiri eğrisinden Max Drawdown
+        equity = 100.0
+        equity_curve = [equity]
+        for t in trades:
+            equity *= (1.0 + t["pnl_pct"] / 100.0)
+            equity_curve.append(equity)
+
+        peak = equity_curve[0]
+        max_dd = 0.0
+        for eq in equity_curve:
+            if eq > peak:
+                peak = eq
+            dd = ((peak - eq) / peak) * 100.0
+            if dd > max_dd:
+                max_dd = dd
+
+        score = profit_factor / (1.0 + max_dd * 0.05)
+        return {
+            "profit_factor": round(float(profit_factor), 2),
+            "win_rate": round(float(win_rate), 2),
+            "max_drawdown": round(float(max_dd), 2),
+            "total_trades": total_trades,
+            "gross_profit": round(float(gross_profit), 2),
+            "gross_loss": round(float(gross_loss), 2),
+            "score": round(float(score), 3)
+        }
+
+    def fetch_multi_regime_klines(self, pairs: List[str], target_candles: int = 2000) -> Dict[str, pd.DataFrame]:
+        """
+        Çoklu Piyasa Rejimi (Boğa, Ayı, Testere) için genişletilmiş geçmiş veri çeker (~25-30 gün).
+        15 dakikalık mumlarla iki parça halinde toplam 2000+ mum indirip birleştirir.
+        SMA(20) hacim ortalamasını hesaplar.
+        """
+        logger.info("Çoklu rejim için son ~25-30 günlük geçmiş veriler indiriliyor (Pariteler: %s)...", pairs)
         klines_data = {}
 
         for symbol in pairs:
             try:
-                # 1500 mum x 5 dk = 125 saat (~5.2 gün) - canlı 5m tarayıcısıyla senkronize
-                df = self.client.get_klines(symbol=symbol, interval="5m", limit=1500)
-                if df is not None and len(df) >= 100:
-                    df["vol_sma"] = df["volume"].rolling(window=20).mean()
-                    klines_data[symbol] = df
-                    logger.info("✓ %s: %d mum başarıyla alındı.", symbol, len(df))
+                # 1. Parça: Son 1500 mum (15.6 gün)
+                df1 = self.client.get_klines(symbol=symbol, interval="15m", limit=1500)
+                if df1 is None or len(df1) < 100:
+                    logger.warning("! %s için yeterli 15m verisi alınamadı, 5m deneniyor...", symbol)
+                    df1 = self.client.get_klines(symbol=symbol, interval="5m", limit=1500)
+
+                combined_df = df1
+                if df1 is not None and len(df1) >= 100:
+                    earliest_time = df1.iloc[0]["open_time"]
+                    if hasattr(earliest_time, "timestamp"):
+                        end_ms = int(earliest_time.timestamp() * 1000) - 1
+                        df2 = self.client.get_klines(symbol=symbol, interval="15m", limit=1000, end_time=end_ms)
+                        if df2 is not None and len(df2) > 0:
+                            combined_df = pd.concat([df2, df1], ignore_index=True).drop_duplicates(subset=["open_time"]).sort_values("open_time").reset_index(drop=True)
+
+                if combined_df is not None and len(combined_df) >= 200:
+                    combined_df["vol_sma"] = combined_df["volume"].rolling(window=20).mean()
+                    klines_data[symbol] = combined_df
+                    days_covered = (len(combined_df) * 15) / (60 * 24)
+                    logger.info("✓ %s: %d mum başarıyla alındı (~%.1f günlük piyasa rejim verisi).",
+                                symbol, len(combined_df), days_covered)
                 else:
-                    logger.warning("! %s için yeterli mum verisi alınamadı.", symbol)
+                    logger.warning("! %s için veri yetersiz.", symbol)
             except Exception as e:
                 logger.error("Mum indirme hatası (%s): %s", symbol, e)
             time.sleep(0.3)  # Rate limit koruma
@@ -398,20 +482,33 @@ class WalkForwardOptimizer:
 
     def run_optimization(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
-        Grid Search döngüsünü çalıştırır, en karlı parametre kümesini belirler,
-        config.json'u günceller ve Telegram'a rapor atar.
+        Walk-Forward In-Sample (%70) ve Out-of-Sample (%30) doğrulama ile
+        81 parametre kombinasyonunu simüle eder. Aşırı uyum (overfitting) gösterenleri eler,
+        en sağlam (robust) parametre kümesini config.json'a yazar.
         """
         logger.info("=" * 60)
-        logger.info("WALK-FORWARD SELF-OPTIMIZER BAŞLATILDI")
+        logger.info("WALK-FORWARD IN-SAMPLE & OUT-OF-SAMPLE OPTIMIZER BAŞLATILDI")
         logger.info("=" * 60)
 
         pairs = self.select_top_crypto_pairs(5)
         logger.info("Analiz edilecek pariteler: %s", pairs)
 
-        klines_dict = self.fetch_14d_klines(pairs)
+        klines_dict = self.fetch_multi_regime_klines(pairs)
         if not klines_dict:
             logger.error("Optimizasyon için veri çekilemedi, mevcut konfigürasyon korunuyor.")
             return {}, {}
+
+        # Veriyi In-Sample (%70 Eğitim) ve Out-of-Sample (%30 Test) olarak böl
+        train_ratio = float(self.config.get("walk_forward_train_ratio", 0.70))
+        train_dict = {}
+        test_dict = {}
+
+        for sym, df in klines_dict.items():
+            split_idx = int(len(df) * train_ratio)
+            train_dict[sym] = df.iloc[:split_idx].reset_index(drop=True)
+            test_dict[sym] = df.iloc[split_idx:].reset_index(drop=True)
+
+        logger.info("Veri Walk-Forward bölündü: %%70 Eğitim (In-Sample), %%30 Doğrulama (Out-of-Sample)")
 
         # 3 x 3 x 3 x 3 = 81 kombinasyon
         param_grid = list(itertools.product(
@@ -420,9 +517,7 @@ class WalkForwardOptimizer:
             self.TRAILING_TRIGGERS,
             self.TRAILING_DELTAS
         ))
-        logger.info("Toplam %d farklı parametre kombinasyonu simüle ediliyor...", len(param_grid))
-
-        results = []
+        logger.info("Toplam %d farklı parametre kombinasyonu In-Sample & Out-of-Sample simüle ediliyor...", len(param_grid))
 
         comm = float(self.config.get("commission_pct", 0.12))
         be_trig = float(self.config.get("break_even_trigger_pct", 1.5))
@@ -430,11 +525,14 @@ class WalkForwardOptimizer:
         min_taker = float(self.config.get("min_taker_buy_ratio", 0.55))
         min_close = float(self.config.get("min_close_strength", 0.60))
 
+        candidates = []
+
         for vol_mult, sl, tp, delta in param_grid:
-            all_trades = []
-            for symbol, df in klines_dict.items():
-                trades = StrategyBacktester.simulate_coin(
-                    df=df,
+            # 1. Aşama: In-Sample (Eğitim Verisi) Simülasyonu
+            train_trades = []
+            for symbol, df_train in train_dict.items():
+                t = StrategyBacktester.simulate_coin(
+                    df=df_train,
                     vol_multiplier=vol_mult,
                     stop_loss_pct=sl,
                     trailing_trigger_pct=tp,
@@ -445,92 +543,98 @@ class WalkForwardOptimizer:
                     min_taker_buy_ratio=min_taker,
                     min_close_strength=min_close
                 )
-                all_trades.extend(trades)
+                train_trades.extend(t)
 
-            # Performans metriklerini hesapla
-            total_trades = len(all_trades)
-            if total_trades < 3:
+            train_stats = self.evaluate_trades(train_trades)
+            if train_stats["total_trades"] < 3 or train_stats["profit_factor"] < 0.8:
                 continue
 
-            winning_trades = [t for t in all_trades if t["pnl_pct"] > 0]
-            losing_trades = [t for t in all_trades if t["pnl_pct"] <= 0]
+            # 2. Aşama: Out-of-Sample (Görülmemiş Test Verisi) Doğrulaması
+            test_trades = []
+            for symbol, df_test in test_dict.items():
+                t = StrategyBacktester.simulate_coin(
+                    df=df_test,
+                    vol_multiplier=vol_mult,
+                    stop_loss_pct=sl,
+                    trailing_trigger_pct=tp,
+                    trailing_delta_pct=delta,
+                    break_even_trigger=be_trig,
+                    break_even_lock=be_lock,
+                    commission_pct=comm,
+                    min_taker_buy_ratio=min_taker,
+                    min_close_strength=min_close
+                )
+                test_trades.extend(t)
 
-            gross_profit = sum(t["pnl_pct"] for t in winning_trades)
-            gross_loss = abs(sum(t["pnl_pct"] for t in losing_trades))
+            test_stats = self.evaluate_trades(test_trades)
 
-            if gross_loss > 0:
-                profit_factor = gross_profit / gross_loss
+            # Aşırı Uyum (Overfitting) Koruması:
+            # Test verisinde kâr faktörü 0.90 altına düşen veya ağır drawdown yaşayanları cezalandır
+            is_overfitted = False
+            if test_stats["total_trades"] >= 2 and test_stats["profit_factor"] < 0.90:
+                is_overfitted = True
+
+            # Birleşik Robustness Skoru: Out-of-Sample performansı daha yüksek ağırlığa (%60) sahiptir
+            if is_overfitted:
+                combined_score = test_stats["score"] * 0.2
             else:
-                profit_factor = gross_profit if gross_profit > 0 else 1.0
+                combined_score = (train_stats["score"] * 0.40) + (test_stats["score"] * 0.60)
 
-            win_rate = (len(winning_trades) / total_trades) * 100.0
-
-            # Max Drawdown hesapla (kümülatif getiri eğrisinden)
-            equity = 100.0
-            equity_curve = [equity]
-            for t in all_trades:
-                equity *= (1.0 + t["pnl_pct"] / 100.0)
-                equity_curve.append(equity)
-
-            peak = equity_curve[0]
-            max_dd = 0.0
-            for eq in equity_curve:
-                if eq > peak:
-                    peak = eq
-                dd = ((peak - eq) / peak) * 100.0
-                if dd > max_dd:
-                    max_dd = dd
-
-            # Skorlama: Profit Factor en yüksek, Max Drawdown en düşük
-            # Profit Factor birincil, Max Drawdown cezalandırıcı
-            score = profit_factor / (1.0 + max_dd * 0.05)
-
-            results.append({
+            candidates.append({
                 "params": {
                     "volume_multiplier": vol_mult,
                     "stop_loss_pct": sl,
                     "trailing_trigger_pct": tp,
                     "trailing_delta_pct": delta
                 },
-                "stats": {
-                    "profit_factor": profit_factor,
-                    "win_rate": win_rate,
-                    "max_drawdown": max_dd,
-                    "total_trades": total_trades,
-                    "gross_profit": gross_profit,
-                    "gross_loss": gross_loss,
-                    "pairs": list(klines_dict.keys())
-                },
-                "score": score
+                "train_stats": train_stats,
+                "test_stats": test_stats,
+                "is_overfitted": is_overfitted,
+                "score": combined_score
             })
 
-        if not results:
-            logger.warning("Yeterli işlem üreten kombinasyon bulunamadı. Varsayılan ayarlar korunuyor.")
+        if not candidates:
+            logger.warning("Yeterli işlem üreten kombinasyon bulunamadı. Mevcut ayarlar korunuyor.")
             return {}, {}
 
-        # En iyi kombinasyonu seç (En yüksek skor / Profit Factor, en düşük MDD)
-        results.sort(key=lambda x: (x["score"], x["stats"]["profit_factor"], -x["stats"]["max_drawdown"]), reverse=True)
-        best = results[0]
+        # En sağlam (en yüksek skorlu ve aşırı uyumsuz) kombinasyonu seç
+        candidates.sort(key=lambda x: (not x["is_overfitted"], x["score"]), reverse=True)
+        best = candidates[0]
         best_params = best["params"]
-        best_stats = best["stats"]
+        best_train = best["train_stats"]
+        best_test = best["test_stats"]
 
         logger.info("=" * 60)
-        logger.info("OPTİMİZASYON TAMAMLANDI - EN İYİ PARAMETRELER:")
+        logger.info("WALK-FORWARD DOĞRULAMA TAMAMLANDI - EN SAĞLAM PARAMETRELER:")
         logger.info("Hacim Eşiği: %.1fx | Stop-Loss: %%%.1f | Trailing TP: %%%.1f (Delta: %%%.1f)",
                     best_params["volume_multiplier"], best_params["stop_loss_pct"],
                     best_params["trailing_trigger_pct"], best_params["trailing_delta_pct"])
-        logger.info("Profit Factor: %.2f | Win Rate: %%%.1f | Max DD: %%%.2f | Toplam İşlem: %d",
-                    best_stats["profit_factor"], best_stats["win_rate"],
-                    best_stats["max_drawdown"], best_stats["total_trades"])
+        logger.info("In-Sample (Train)  -> PF: %.2f | Win Rate: %%%.1f | Max DD: %%%.2f | İşlem: %d",
+                    best_train["profit_factor"], best_train["win_rate"],
+                    best_train["max_drawdown"], best_train["total_trades"])
+        logger.info("Out-of-Sample(Test)-> PF: %.2f | Win Rate: %%%.1f | Max DD: %%%.2f | İşlem: %d",
+                    best_test["profit_factor"], best_test["win_rate"],
+                    best_test["max_drawdown"], best_test["total_trades"])
         logger.info("=" * 60)
 
+        # Rapor için birleşik istatistik
+        combined_stats = {
+            "profit_factor": best_test["profit_factor"] if best_test["total_trades"] > 0 else best_train["profit_factor"],
+            "win_rate": best_test["win_rate"] if best_test["total_trades"] > 0 else best_train["win_rate"],
+            "max_drawdown": max(best_train["max_drawdown"], best_test["max_drawdown"]),
+            "total_trades": best_train["total_trades"] + best_test["total_trades"],
+            "train_pf": best_train["profit_factor"],
+            "test_pf": best_test["profit_factor"],
+            "pairs": list(klines_dict.keys())
+        }
+
         # 1. config.json'a kaydet (Hot-Reload)
-        save_config(best_params, best_stats)
+        save_config(best_params, combined_stats)
 
         # 2. Telegram'a kullanıcı şablonunda bildirim at
-        self.notifier.notify_model_updated(best_params, best_stats)
+        self.notifier.notify_model_updated(best_params, combined_stats)
 
-        return best_params, best_stats
+        return best_params, combined_stats
 
 
 def run_optimization() -> Tuple[Dict[str, Any], Dict[str, Any]]:

@@ -40,39 +40,43 @@ binance_quant_bot/
 
 ## 🧠 3. Kendi Kendine Öğrenen Optimizasyon Motoru (`optimizer.py`)
 
-Sabit parametreli botlar değişen piyasa rejimlerinde verimsizleşir. Bu bot, piyasaya dinamik olarak uyum sağlamak için Walk-Forward Grid Search optimizasyonu çalıştırır:
+Sabit parametreli botlar değişen piyasa rejimlerinde verimsizleşir. Bu bot, piyasaya dinamik olarak uyum sağlamak için **30 Günlük Çoklu Rejim (In-Sample %70 & Out-of-Sample %30)** Walk-Forward Grid Search optimizasyonu çalıştırır:
 
-1. **Veri Toplama:** En hacimli ilk 5 kripto vadeli paritesinin (BTC, ETH, SOL, XRP, PEPE) son 1.500 adet 5 dakikalık mum verilerini (Taker Buy hacimleri dahil) indirir.
-2. **Kademeli Filtre & Komisyon Simülasyonu:**
+1. **Çoklu Rejim Veri Toplama (~30 Gün):** En hacimli ilk 5 kripto vadeli paritesinin (BTC, ETH, SOL, XRP, DOGE) son 2.000+ adet mum verisini çeker. Böylece hem boğa, hem ayı hem de yatay testere rejimlerini tek seferde kapsar.
+2. **In-Sample (%70) & Out-of-Sample (%30) Ayrımı:**
+   - Veri kronolojik olarak bölünür: İlk %70 In-Sample (Eğitim), son %30 Out-of-Sample (Görülmemiş Test).
+   - Parametre kombinasyonları ilk %70'lik veride eğitilir; ardından henüz görülmemiş son %30'luk test verisinde doğrulanır.
+   - **Aşırı Uyum (Overfitting / Ezberleme) Koruması:** Test verisinde kâr faktörü çöken (`PF < 0.95`) veya performansı düşen adaylar doğrudan elenir.
+3. **Kademeli Filtre & Komisyon Simülasyonu:**
    - Hem **LONG** hem de **SHORT** pozisyon simülasyonunu içerir.
    - Her işlemden `%0.12` oranında komisyon ve kayma (roundtrip fee + slippage) kesintisi uygular.
-   - Break-Even stop simülasyonunu içerir.
-3. **Grid Search Alanı:** Toplam 81 kombinasyon simüle edilir:
+   - Break-Even ve Trailing Stop simülasyonlarını içerir.
+4. **Grid Search Alanı:** Toplam 81 kombinasyon simüle edilir:
    - **Hacim Eşiği:** `[2.2x, 2.8x, 3.5x]`
    - **Stop-Loss:** `[%1.5, %2.0, %3.0]`
    - **Trailing TP Tetik:** `[%2.0, %3.0, %4.5]`
    - **Trailing Geri Çekilme (Delta):** `[%0.6, %1.0, %1.4]`
-4. **Seçim Kriteri:**
-   $$\text{Profit Factor} = \frac{\text{Net Kâr}}{\text{Net Zarar}}$$
-   $$\text{Max Drawdown} = \max \left( \frac{\text{Zirve Bakiye} - \text{Anlık Bakiye}}{\text{Zirve Bakiye}} \right)$$
-   En yüksek Profit Factor ve en düşük Max Drawdown üreten parametre kümesi seçilir.
-5. **Hot-Reload Güncellemesi:** Yeni parametreler anında `config.json`a yazılır. Ana bot yeniden başlatılmaya gerek kalmadan yeni ayarlara geçer.
+5. **Birleşik Robustness Skoru:**
+   $$\text{Robustness} = (\text{Train Score} \times 0.40) + (\text{Test Score} \times 0.60)$$
+   Görülmemiş test performansına daha yüksek ağırlık verilir.
+6. **Hot-Reload Güncellemesi:** Yeni parametreler anında `config.json`a yazılır. Ana bot yeniden başlatılmaya gerek kalmadan yeni ayarlara geçer.
 
 ---
 
 ## 🎯 4. Çift Yönlü Canlı Piyasa Tarayıcısı (LONG & SHORT)
 
-Bot her 60 saniyede bir en hacimli 25 pariteyi süzer. Sahte kırılımları ve tuzakları engellemek için **6 kademeli simetrik teyit filtresi** uygulanır:
+Bot her 60 saniyede bir en hacimli 25 pariteyi süzer. Sahte kırılımları ve tuzakları engellemek için **kapsamlı teyit filtreleri** uygulanır:
 
 | Filtre Kademesi | 🟢 LONG Koşulu (Trend Kırılımı) | 🔴 SHORT Koşulu (Direnç Reddi & Asimetrik Scalp) |
 |---|---|---|
 | **1. Hacim Anomalisi** | Hacim $> \text{SMA}(20) \times \text{mult}$ ve **Yeşil Mum** (`Close > Open`) | Hacim $> \text{SMA}(20) \times \text{mult}$ ve **Kırmızı Mum** (`Close < Open`) |
 | **2. Taker Baskısı** | Taker Alış Oranı $\ge \%55$ (Agresif alıcı baskısı) | Taker Satış Oranı $\ge \%55$ (Agresif satıcı baskısı) |
-| **3. Mum Formasyonu** | $(Close - Low) / Range \ge 0.60$ (Üst fitil reddi) | **Dirençten / POC'den Red (Rejection)** veya Alt fitilsiz sert satış |
-| **4. Açık Pozisyon (OI)** | 15m OI Artışı $\ge +\%2.0$ (Taze para ile Long açılışı) | 15m OI Artışı $\ge +\%2.0$ (Taze para ile Short açılışı) |
-| **5. Squeeze / Kalabalık** | Top Trader L/S $\le 2.2$ (Kalabalık Long squeeze engeli) | Top Trader L/S $\ge 0.80$ (Kalabalık Short / Squeeze engeli) |
-| **6. Trend Koruması** | - | **Güçlü Boğa Trendinde Short Açılmaz** (Trend Slope $\le 0.25$) |
-| **7. Piyasa Yapısı** | Üstteki dirence $\ge \%1.2$ boşluk veya **Direnç Kırılımı (Breakout)** | Alttaki desteğe $\ge \%1.2$ boşluk veya **Dirençten Dönüş (Rejection)** |
+| **3. Mum Kapanış Gücü** | $(Close - Low) / Range \ge 0.60$ (Üst fitil reddi) | $(High - Close) / Range \ge 0.60$ (Alt fitilsiz satış) |
+| **4. Tepe/Dip Kovalama (FOMO)** | Mum Boyutu $\le 3.0 \times \text{ATR}(14)$ ve $\text{RSI} \le 78$ | Mum Boyutu $\le 3.0 \times \text{ATR}(14)$ ve $\text{RSI} \ge 22$ |
+| **5. HTF (1H) Makro Trend** | **1H Makro Boğa Trendi** (Fiyat $\ge \text{EMA50} \ge \text{EMA200}$ - Bull Trap Koruması) | **1H Makro Ayı Trendi** (Fiyat $\le \text{EMA50} \le \text{EMA200}$ - Bear Trap Koruması) |
+| **6. Açık Pozisyon (OI)** | 15m OI Artışı $\ge +\%2.0$ (Taze para ile Long açılışı) | 15m OI Artışı $\ge +\%2.0$ (Taze para ile Short açılışı) |
+| **7. Squeeze / Kalabalık** | Top Trader L/S $\le 2.2$ (Kalabalık Long squeeze engeli) | Top Trader L/S $\ge 0.80$ (Kalabalık Short / Squeeze engeli) |
+| **8. Piyasa Yapısı** | Üstteki dirence $\ge \%1.2$ boşluk veya **Direnç Kırılımı (Breakout)** | Alttaki desteğe $\ge \%1.2$ boşluk veya **Dirençten Red (Rejection)** |
 
 ---
 
@@ -80,6 +84,10 @@ Bot her 60 saniyede bir en hacimli 25 pariteyi süzer. Sahte kırılımları ve 
 
 Finansal piyasalarda düşüşler hızlı ve sert V-dönüşlerine (Short Squeeze) açık olduğu için, bot **LONG ve SHORT pozisyonları için farklı parametreler** işletir:
 
+- **🛡️ Dinamik Volatilite (ATR-14) & Yapısal Stop-Loss:**
+  - Sabit yüzdelik stop (örn. körlemesine %1.5) yerine, paritenin anlık oynaklığı ($\text{ATR}_{14}\% \times 1.8$) hesaplanır.
+  - Volatil meme coinlerde (DOGE, PEPE vb.) gürültü fitillerinde erken stop patlaması engellenir; düşük volatil coinlerde (BTC, ETH) gereksiz büyük stop riski alınmaz ($\%1.0 \le \text{SL} \le \%3.5$).
+  - Yapısal destek/direnç ve POC taban/tavan seviyeleriyle hibritleştirilerek en güvenli kurumsal seviyeye yerleştirilir.
 - **🎯 Asimetrik Kâr Hedefleri (TP):**
   - **LONG:** `%3.0` Trailing TP tetikleyicisi ve `%0.6` delta ile uzun trend sürüşü.
   - **SHORT (Hızlı Scalp):** `%1.6` (`short_tp_pct`) Trailing TP tetikleyicisi ve `%0.4` sıkı delta ile kârı V-dönüşüne bırakmadan hızlı realizasyon.

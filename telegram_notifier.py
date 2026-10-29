@@ -178,12 +178,21 @@ class TelegramNotifier:
             elif is_breakdown:
                 break_tag = " ⚡ *[DESTEK KIRILIMI - BREAKDOWN]*"
 
+            htf_bias = structure_info.get("htf_bias", "NEUTRAL")
+            htf_desc = structure_info.get("htf_desc", "")
+            atr_pct = structure_info.get("atr_pct", 0.0)
+            rsi_val = structure_info.get("rsi_value", 50.0)
+
+            htf_badge = "🟢 Boğa (Bullish)" if htf_bias == "BULLISH" else ("🔴 Ayı (Bearish)" if htf_bias == "BEARISH" else "⚪ Nötr")
+
             struct_section = (
-                f"🧱 *Piyasa Yapısı & Hacim Profili:*{break_tag}\n"
+                f"🧱 *Piyasa Yapısı & Makro Rejim:*{break_tag}\n"
+                f"• 1H Makro Trend: *{htf_badge}*\n"
+                f"• Volatilite (ATR-14): `%{atr_pct:.2f}` | RSI(14): `{rsi_val:.1f}`\n"
                 f"• En Yakın Destek: `{sup_str}`\n"
                 f"• Hacim POC: `{poc_str}`\n"
                 f"• En Yakın Direnç: `{res_str}`\n"
-                f"• Trend Yönü: *{trend_dir}* (`{trend_slope:+.2f}%/saat`)\n\n"
+                f"• 5m Trend: *{trend_dir}* (`{trend_slope:+.2f}%/saat`)\n\n"
             )
 
         title = "🔴 *YENİ SANAL SHORT SİNYALİ AÇILDI*" if is_short else "🟢 *YENİ SANAL LONG SİNYALİ AÇILDI*"

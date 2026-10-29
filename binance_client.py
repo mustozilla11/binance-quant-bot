@@ -30,6 +30,9 @@ class BinanceFuturesClient:
         self._tradifi_symbols: set[str] = set()
         self._last_tradifi_fetch: float = 0.0
 
+        # HTF ve Mum önbelleği (symbol_interval -> (timestamp, df))
+        self._klines_cache: Dict[str, Any] = {}
+
         # Türkiye / ISP SNI filtreleme kontrolü ve uygun URL kökünü belirleme
         self.base_url, self.custom_headers = self._determine_working_endpoint()
 
@@ -153,15 +156,26 @@ class BinanceFuturesClient:
         usdt_pairs.sort(key=lambda x: x[1], reverse=True)
         return [pair[0] for pair in usdt_pairs[:limit]]
 
-    def get_klines(self, symbol: str, interval: str = "5m", limit: int = 100) -> Optional[pd.DataFrame]:
+    def get_klines(self, symbol: str, interval: str = "5m", limit: int = 100, cache_ttl_sec: int = 0, end_time: Optional[int] = None) -> Optional[pd.DataFrame]:
         """
         Mum (kline) verilerini çeker ve pandas DataFrame olarak döndürür.
+        cache_ttl_sec > 0 ise belirtilen süre boyunca (örn. 1h verisi için 300s) önbellekten sunar.
         """
-        params = {
+        now = time.time()
+        cache_key = f"{symbol}_{interval}_{limit}_{end_time}"
+
+        if cache_ttl_sec > 0 and cache_key in self._klines_cache:
+            cached_time, cached_df = self._klines_cache[cache_key]
+            if (now - cached_time) < cache_ttl_sec:
+                return cached_df.copy()
+
+        params: Dict[str, Any] = {
             "symbol": symbol,
             "interval": interval,
             "limit": limit
         }
+        if end_time is not None:
+            params["endTime"] = end_time
         raw_klines = self._request("/fapi/v1/klines", params=params)
         if not raw_klines or not isinstance(raw_klines, list):
             return None
@@ -180,6 +194,10 @@ class BinanceFuturesClient:
 
         df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
         df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+
+        if cache_ttl_sec > 0:
+            self._klines_cache[cache_key] = (now, df)
+
         return df
 
     def get_open_interest_change(self, symbol: str) -> Optional[float]:
