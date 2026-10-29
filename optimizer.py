@@ -60,6 +60,12 @@ DEFAULT_CONFIG = {
     "top_pairs_count": 25,
     "oi_min_increase_pct": 2.0,
     "top_trader_ls_max": 2.2,
+    "use_sr_filter": True,
+    "sr_pivot_window": 5,
+    "sr_cluster_tolerance_pct": 0.4,
+    "min_room_to_resistance_pct": 1.2,
+    "dynamic_tp_enabled": True,
+    "structural_sl_enabled": True,
     "blacklist": [
         "BZUSDT",
         "XAUUSDT",

@@ -38,6 +38,7 @@ import pandas as pd
 from binance_client import BinanceFuturesClient
 from telegram_notifier import TelegramNotifier
 from optimizer import run_optimization, load_config, CONFIG_PATH
+from market_structure import analyze_market_structure, MarketStructureResult
 
 # Loglama Konfigürasyonu
 LOG_PATH = os.path.join(SCRIPT_DIR, "bot.log")
@@ -73,13 +74,19 @@ class Position:
     break_even_active: bool = False
     peak_price: float = 0.0
     peak_pnl_pct: float = 0.0
+    nearest_support: Optional[float] = None
+    nearest_resistance: Optional[float] = None
+    poc_price: Optional[float] = None
+    trend_direction: str = "Bilinmiyor"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Position":
-        return cls(**data)
+        valid_keys = cls.__dataclass_fields__.keys()
+        filtered = {k: v for k, v in data.items() if k in valid_keys}
+        return cls(**filtered)
 
 
 class PaperTradingBot:
@@ -189,7 +196,8 @@ class PaperTradingBot:
             keys_to_compare = [
                 "volume_multiplier", "stop_loss_pct", "trailing_trigger_pct",
                 "trailing_delta_pct", "max_concurrent_positions", "trade_amount_usdt",
-                "break_even_trigger_pct", "commission_pct", "oi_min_increase_pct", "top_trader_ls_max"
+                "break_even_trigger_pct", "commission_pct", "oi_min_increase_pct", "top_trader_ls_max",
+                "use_sr_filter", "min_room_to_resistance_pct", "dynamic_tp_enabled", "structural_sl_enabled"
             ]
             changes = []
             for k in keys_to_compare:
@@ -318,9 +326,15 @@ class PaperTradingBot:
             be_str = " (🛡️ BE Aktif)" if pos.break_even_active else ""
             tr_str = " (🎯 Trailing Aktif)" if pos.trailing_active else ""
 
+            sr_part = ""
+            if pos.nearest_resistance or pos.poc_price:
+                res_txt = f"${pos.nearest_resistance:.4f}" if pos.nearest_resistance else "Açık"
+                poc_txt = f"${pos.poc_price:.4f}" if pos.poc_price else "Yok"
+                sr_part = f"\n   ↳ Direnç: `{res_txt}` | POC: `{poc_txt}` | Trend: `{pos.trend_direction}`"
+
             lines.append(
                 f"{emoji} *{sym}*: `${curr_p:.4f}` | PnL: *%{pnl:+.2f}* (*${pnl_usd:+.2f}*)\n"
-                f"   ↳ Giriş: `${pos.entry_price:.4f}` | Süre: `{duration:.1f} dk`{be_str}{tr_str}"
+                f"   ↳ Giriş: `${pos.entry_price:.4f}` | Süre: `{duration:.1f} dk`{be_str}{tr_str}{sr_part}"
             )
         lines.append("━━━━━━━━━━━━━━━━━━━━━")
         self.notifier.send_message("\n".join(lines))
@@ -521,7 +535,7 @@ class PaperTradingBot:
                     continue
 
             # 1. Filtre: 5m Hacim Anomalisi ve Mum Formasyonu
-            df = self.client.get_klines(symbol, interval="5m", limit=30)
+            df = self.client.get_klines(symbol, interval="5m", limit=288)
             if df is None or len(df) < 25:
                 continue
 
@@ -586,10 +600,55 @@ class PaperTradingBot:
             logger.info("  ↳ [%s] L/S Teyidi BAŞARILI: %.2f <= %.2f (Aşırı kalabalık değil) 🟢",
                         symbol, ls_ratio, max_ls_ratio)
 
-            # TÜM 5 FİLTRE SAĞLANDI -> SANAL LONG AÇ
+            # 6. Filtre: Piyasa Yapısı (Destek / Direnç / POC / Room-to-Run)
+            struct_info = None
+            use_sr = bool(self.config.get("use_sr_filter", True))
             entry_price = float(candle["close"])
-            sl_pct = float(self.config.get("stop_loss_pct", 2.0))
-            tp_pct = float(self.config.get("trailing_trigger_pct", 3.0))
+            default_sl = float(self.config.get("stop_loss_pct", 2.0))
+            default_tp = float(self.config.get("trailing_trigger_pct", 3.0))
+
+            if use_sr:
+                sr_window = int(self.config.get("sr_pivot_window", 5))
+                sr_tol = float(self.config.get("sr_cluster_tolerance_pct", 0.4))
+                min_room = float(self.config.get("min_room_to_resistance_pct", 1.2))
+                dyn_tp = bool(self.config.get("dynamic_tp_enabled", True))
+                struct_sl = bool(self.config.get("structural_sl_enabled", True))
+                prev_c = float(df["close"].iloc[-2]) if len(df) >= 2 else None
+
+                struct_res = analyze_market_structure(
+                    symbol=symbol,
+                    df=df,
+                    current_price=entry_price,
+                    prev_close=prev_c,
+                    window=sr_window,
+                    tolerance_pct=sr_tol,
+                    min_room_to_resistance_pct=min_room,
+                    default_tp_pct=default_tp,
+                    default_sl_pct=default_sl,
+                    dynamic_tp_enabled=dyn_tp,
+                    structural_sl_enabled=struct_sl
+                )
+                struct_info = struct_res.to_dict()
+
+                if not struct_res.has_room_to_run:
+                    logger.info("  ↳ [%s] %s. İşlem İptal Edildi 🛑", symbol, struct_res.rejection_reason)
+                    continue
+
+                if struct_res.is_breakout:
+                    logger.info("  ↳ [%s] ⚡ DİRENÇ KIRILIMI ONAYLANDI (Kırılan Direnç: $%.4f) 🟢",
+                                symbol, struct_res.broken_resistance or 0.0)
+                else:
+                    res_str = f"+%{struct_res.dist_to_resistance_pct:.2f}" if struct_res.dist_to_resistance_pct else "Açık Yol"
+                    logger.info("  ↳ [%s] Yapısal Boşluk Teyidi BAŞARILI: Direnç Mesafesi %s (POC: $%.4f | Trend: %s) 🟢",
+                                symbol, res_str, struct_res.poc_price, struct_res.trend_direction)
+
+                sl_pct = struct_res.suggested_sl_pct
+                tp_pct = struct_res.suggested_tp_pct
+            else:
+                sl_pct = default_sl
+                tp_pct = default_tp
+
+            # TÜM FİLTRELER SAĞLANDI -> SANAL LONG AÇ
             delta_pct = float(self.config.get("trailing_delta_pct", 1.0))
             timeout_m = int(self.config.get("position_timeout_minutes", 40))
             trade_amount_usdt = float(self.config.get("trade_amount_usdt", 100.0))
@@ -614,15 +673,19 @@ class PaperTradingBot:
                 trailing_active=False,
                 break_even_active=False,
                 peak_price=entry_price,
-                peak_pnl_pct=0.0
+                peak_pnl_pct=0.0,
+                nearest_support=struct_info.get("nearest_support") if struct_info else None,
+                nearest_resistance=struct_info.get("nearest_resistance") if struct_info else None,
+                poc_price=struct_info.get("poc_price") if struct_info else None,
+                trend_direction=struct_info.get("trend_direction", "Bilinmiyor") if struct_info else "Bilinmiyor"
             )
 
             self.active_positions[symbol] = new_pos
             self.cooldowns[symbol] = now  # 30 dk soğuma başlat
             self._save_positions_to_disk()  # Diske anlık kaydet
 
-            logger.info("✅ [YENİ SANAL LONG] %s @ $%.4f ($%.2f USDT, Miktar: %.4f) | SL: $%.4f | Trailing: $%.4f",
-                        symbol, entry_price, trade_amount_usdt, qty, sl_price, tp_trigger_price)
+            logger.info("✅ [YENİ SANAL LONG] %s @ $%.4f ($%.2f USDT, Miktar: %.4f) | SL: $%.4f (%%%s) | TP Tetik: $%.4f (%%%s)",
+                        symbol, entry_price, trade_amount_usdt, qty, sl_price, sl_pct, tp_trigger_price, tp_pct)
 
             # Telegram Sinyal Kartı İlet
             self.notifier.notify_signal_card(
@@ -633,7 +696,8 @@ class PaperTradingBot:
                 ls_ratio=ls_ratio,
                 sl_price=sl_price,
                 tp_trigger_price=tp_trigger_price,
-                config=self.config
+                config=self.config,
+                structure_info=struct_info
             )
 
             # Eşzamanlı pozisyon limiti varsa ve ulaşıldıysa bu turu bitir

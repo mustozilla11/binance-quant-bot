@@ -130,7 +130,8 @@ class TelegramNotifier:
         ls_ratio: float,
         sl_price: float,
         tp_trigger_price: float,
-        config: Dict[str, Any]
+        config: Dict[str, Any],
+        structure_info: Optional[Dict[str, Any]] = None
     ) -> bool:
         """
         Canlı piyasa tarayıcısından 3 kriter sağlandığında atılan görsel sinyal kartı.
@@ -148,6 +149,30 @@ class TelegramNotifier:
         qty_fmt = ".2f" if qty >= 10 else (".4f" if qty >= 0.1 else ".6f")
         base_coin = symbol.replace("USDT", "")
 
+        struct_section = ""
+        if structure_info:
+            nearest_sup = structure_info.get("nearest_support")
+            sup_dist = structure_info.get("dist_to_support_pct")
+            nearest_res = structure_info.get("nearest_resistance")
+            res_dist = structure_info.get("dist_to_resistance_pct")
+            poc_p = structure_info.get("poc_price")
+            trend_dir = structure_info.get("trend_direction", "Bilinmiyor")
+            trend_slope = structure_info.get("trend_slope_hourly_pct", 0.0)
+            is_breakout = structure_info.get("is_breakout", False)
+
+            sup_str = f"${nearest_sup:{fmt}} (-%{sup_dist:.2f})" if nearest_sup else "Bulunamadı"
+            res_str = f"${nearest_res:{fmt}} (+%{res_dist:.2f})" if nearest_res else "Açık Yol (Hedef Serbest)"
+            poc_str = f"${poc_p:{fmt}}" if (poc_p and poc_p > 0) else "Yok"
+            breakout_tag = " ⚡ *[DİRENÇ KIRILIMI]*" if is_breakout else ""
+
+            struct_section = (
+                f"🧱 *Piyasa Yapısı & Hacim Profili:*{breakout_tag}\n"
+                f"• En Yakın Destek: `{sup_str}`\n"
+                f"• Hacim POC: `{poc_str}`\n"
+                f"• Üst Direnç Hedefi: `{res_str}`\n"
+                f"• Trend Yönü: *{trend_dir}* (`{trend_slope:+.2f}%/saat`)\n\n"
+            )
+
         text = (
             "🟢 *YENİ SANAL LONG SİNYALİ AÇILDI*\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -159,6 +184,7 @@ class TelegramNotifier:
             f"• 5m Hacim Artışı: *{vol_mult:.2f}x SMA(20)* 🚀\n"
             f"• 15m Açık Pozisyon (OI): *+%{oi_change:.2f}* 🟢\n"
             f"• Top Trader L/S: *{ls_ratio:.2f}* (Kural: <= {max_ls})\n\n"
+            f"{struct_section}"
             "🎯 *Pozisyon Çıkış Parametreleri:*\n"
             f"• Stop-Loss (%{sl_pct}): `${sl_price:{fmt}}`\n"
             f"• Trailing TP Tetik (%{tp_pct}): `${tp_trigger_price:{fmt}}`\n"
