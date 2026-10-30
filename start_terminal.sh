@@ -13,6 +13,6 @@ echo "🔒 Kapak Koruması: AKTİF (Kapağı kapatsan da uykuya geçmez)"
 echo "📺 Canlı log akışı başlıyor... Durdurmak için: CTRL + C"
 echo "============================================================"
 
-systemd-inhibit --what=handle-lid-switch:sleep:idle \
+systemd-inhibit --what=handle-lid-switch:sleep \
                 --why="Binance Quant Paper Trading Bot" \
                 ./.venv/bin/python bot.py
